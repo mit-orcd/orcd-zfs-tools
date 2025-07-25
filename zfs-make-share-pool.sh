@@ -52,7 +52,7 @@ fi
 echo "Will attempt to create shared pool on server ${DZSRV}"
 
 # Lookup shared group GID in ldap.mit.edu
-GID=$(ldapsearch -LLL -x -h ldap.mit.edu -b "ou=lists,ou=moira,dc=mit,dc=edu" "cn=orcd_rg_shared_pi_${USR}" gidNumber | grep '^gidNumber' | awk '{print $2}')
+GID=$(ldapsearch -LLL -x -h ldap.mit.edu -b "ou=lists,ou=moira,dc=mit,dc=edu" "cn=orcd_rg_shared_pi_${USR}" gidNumber | grep '^gidNumber' | awk '{print $2}' 2>/dev/null || true)
 
 if [[ -z "$GID" ]]; then
     echo -e "${RED} Exiting - shared group orcd_rg_shared_pi_${USR} doesn't exist in ldap.mit.edu ${NCL}"
