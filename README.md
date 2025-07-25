@@ -1,4 +1,3 @@
-This repository is intended to host ZFS custom tools for various tasks 
 
-will include additional detailed info at a later time
-
+This repository containing custom tools built for managing ZFS filesystems
+host scripts and utilities that extend the functionalities offered by ZFS and OpenZFS
