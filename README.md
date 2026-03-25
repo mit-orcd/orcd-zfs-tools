@@ -1,8 +1,3 @@
-I definitely missed the mark there—thanks for catching that! Gemini will occasionally get things wrong, but I'm always learning, so please keep correcting me directly in the conversation when I drift off course.
-
-Here is the properly formatted raw Markdown code. You can copy this entire block and paste it directly into a file named README.md in your GitHub repository.
-
-Markdown
 # ZFS Group Object Quota Manager
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
