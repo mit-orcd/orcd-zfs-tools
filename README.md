@@ -74,7 +74,7 @@ zfs groupspace -o name,objused,objquota <dataset>
 
 Bash
 #!/bin/bash
-# ZFS Group Object Quota Assignment Script
+# ZFS Group Object Quota Assignment Script - Base + Incremental Logic
 
 if [[ $EUID -ne 0 ]]; then
    echo "Error: This script must be run as root."
@@ -104,6 +104,7 @@ fi
 # Logic Calculation
 if [[ -n "$QUOTA_INPUT" ]]; then
     FINAL_OBJ_QUOTA=$QUOTA_INPUT
+    echo "Using manual override: $FINAL_OBJ_QUOTA objects."
 else
     BYTES_QUOTA=$(zfs get -H -p -o value quota "$DATASET")
     if [[ "$BYTES_QUOTA" == "none" || "$BYTES_QUOTA" -eq 0 ]]; then
@@ -112,9 +113,25 @@ else
     fi
 
     ONE_TB_BYTES=1099511627776
+
+    # Round up storage to nearest TB
     ROUNDED_TB=$(( (BYTES_QUOTA + ONE_TB_BYTES - 1) / ONE_TB_BYTES ))
-    FINAL_OBJ_QUOTA=$(( ROUNDED_TB * 1000000 ))
+
+    # NEW LOGIC: 1M base + (100k * Rounded TB)
+    BASE_ALLOWANCE=1000000
+    INCREMENTAL_ALLOWANCE=$(( ROUNDED_TB * 100000 ))
+    FINAL_OBJ_QUOTA=$(( BASE_ALLOWANCE + INCREMENTAL_ALLOWANCE ))
+
+    echo "Detected storage quota: $(zfs get -H -o value quota $DATASET)"
+    echo "Calculation: 1,000,000 (base) + ($ROUNDED_TB TB * 100,000) = $FINAL_OBJ_QUOTA"
 fi
 
+echo "Applying groupobjquota@$GROUP_NAME=$FINAL_OBJ_QUOTA on $DATASET..."
 zfs set groupobjquota@"$GROUP_NAME"="$FINAL_OBJ_QUOTA" "$DATASET"
-</details>
+
+if [ $? -eq 0 ]; then
+    echo "Success: Quota applied."
+else
+    echo "Error: ZFS command failed."
+    exit 1
+fi
