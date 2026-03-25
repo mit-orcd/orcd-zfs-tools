@@ -1,8 +1,91 @@
-ZFS Group Object Quota ManagerA technical utility for High-Performance Computing (HPC) environments to automate groupobjquota assignments. This ensures that file count limits scale predictably with storage capacity, preventing metadata-heavy workloads from degrading pool performance.📖 PurposeIn large-scale ZFS deployments, managing disk capacity (bytes) is only one part of system health. Metadata exhaustion—caused by the creation of millions of small files—can lead to:Slowed zfs scrub and resilver operations.Increased latency in directory listings and backups.Inefficient snapshot management.This script enforces a "1 Million Objects per 1 Terabyte" policy, ensuring that as a group's storage allocation grows, their "inode" (object) allowance scales proportionally.⚙️ Logic BreakdownThe script fetches the exact byte count of the dataset quota and applies a ceiling-based calculation to ensure users have a generous buffer.Calculation RuleFor every $1\text{ TB}$ of storage allocated, the group receives $1,000,000$ objects. The script rounds up to the next whole Terabyte.Formula:$$\text{Object Limit} = \lceil \frac{\text{Storage Quota in Bytes}}{1,099,511,627,776} \rceil \times 1,000,000$$ExamplesStorage QuotaCalculation (Ceiling)Resulting Object Quota500 GB$1 \times 1,000,000$1,000,0001.0 TB$1 \times 1,000,000$1,000,0001.3 TB$2 \times 1,000,000$2,000,0005.1 TB$6 \times 1,000,000$6,000,000🚀 UsagePrerequisitesRoot Access: Required to modify ZFS properties.Dependencies: bc (calculator utility) and getent (to verify group existence).ZFS Dataset: The target dataset must have a hard quota set.ExecutionSave the script as set_zfs_group_quota.sh.Make it executable:Bashchmod +x set_zfs_group_quota.sh
-Run the script:Bashsudo ./set_zfs_group_quota.sh <dataset_path> <group_name>
-Command HelpAuto-calculate: sudo ./set_zfs_group_quota.sh data2/pool/zekai staffManual Override: sudo ./set_zfs_group_quota.sh data2/pool/zekai staff 5000000🔍 Verification & MonitoringAdministrators can monitor usage using native ZFS commands:Check assigned limit:Bashzfs get groupobjquota@<group_name> <dataset>
-View usage report:Bashzfs groupspace -o name,objused,objquota <dataset>
-🛠 The ScriptBash#!/bin/bash
+I definitely missed the mark there—thanks for catching that! Gemini will occasionally get things wrong, but I'm always learning, so please keep correcting me directly in the conversation when I drift off course.
+
+Here is the properly formatted raw Markdown code. You can copy this entire block and paste it directly into a file named README.md in your GitHub repository.
+
+Markdown
+# ZFS Group Object Quota Manager
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Storage: OpenZFS](https://img.shields.io/badge/Storage-OpenZFS-blue.svg)](https://openzfs.org/)
+
+An automated utility for High-Performance Computing (HPC) environments to manage file count limits proportional to storage capacity. This script prevents metadata-heavy workloads from degrading system performance by enforcing a standardized object-to-storage ratio.
+
+---
+
+## 📖 Purpose
+
+In large-scale storage environments, managing disk space is only one half of system health. Excessive file creation (metadata bloat) can severely impact:
+* **System Responsiveness:** Slows down directory listings and file access.
+* **Maintenance Operations:** Increases the time required for `zfs scrub` and resilvering.
+* **Backup Performance:** Drastically increases the overhead for file-based backup solutions.
+
+This script enforces a **"1 Million Objects per 1 Terabyte"** policy to ensure the storage system remains fast and reliable for all users.
+
+## ⚙️ Logic & Calculation
+
+The script utilizes a "Ceiling-based" calculation logic. This ensures that users are never penalized for being slightly over a Terabyte boundary and provides a generous buffer for active projects.
+
+### The Calculation Rule
+For every 1 TB (TiB) of storage allocated, the group is granted 1,000,000 objects. The script always rounds the storage quota **up** to the next whole Terabyte.
+
+**Mathematical Formula:**
+
+$$\text{Object Limit} = \lceil \frac{\text{Storage Quota in Bytes}}{1,099,511,627,776} \rceil \times 1,000,000$$
+
+### Examples
+
+| Storage Quota | Logic (Rounded Up) | Resulting Object Limit |
+| :--- | :--- | :--- |
+| **500 GB** | 1 TB | **1,000,000** |
+| **1.0 TB** | 1 TB | **1,000,000** |
+| **1.3 TB** | 2 TB | **2,000,000** |
+| **5.1 TB** | 6 TB | **6,000,000** |
+
+---
+
+## 🚀 Usage Guide
+
+### Prerequisites
+* **Permissions:** Root/Sudo access is required to set ZFS properties.
+* **Dependencies:** `bc` (for arithmetic) and `getent` (for group verification).
+* **Requirements:** The target dataset must have a `quota` property already defined.
+
+### Running the Script
+1.  **Clone or download** the script to your server.
+2.  **Make it executable**:
+    ```bash
+    chmod +x set_zfs_group_quota.sh
+    ```
+3.  **Execute**:
+    ```bash
+    sudo ./set_zfs_group_quota.sh <dataset_path> <group_name>
+    ```
+
+### Examples
+* **Auto-calculate based on quota**:
+  `sudo ./set_zfs_group_quota.sh data2/pool/zekai staff`
+* **Manual override**:
+  `sudo ./set_zfs_group_quota.sh data2/pool/zekai staff 5000000`
+
+---
+
+## 🔍 Verification
+
+To verify the applied quota and monitor current usage, use the following native ZFS commands:
+
+**Check assigned limit:**
+```bash
+zfs get groupobjquota@<group_name> <dataset>
+View usage report:
+
+Bash
+zfs groupspace -o name,objused,objquota <dataset>
+🛠 Script Source
+<details>
+<summary>Click to view the full Bash script</summary>
+
+Bash
+#!/bin/bash
 # ZFS Group Object Quota Assignment Script
 
 if [[ $EUID -ne 0 ]]; then
@@ -46,4 +129,4 @@ else
 fi
 
 zfs set groupobjquota@"$GROUP_NAME"="$FINAL_OBJ_QUOTA" "$DATASET"
-
+</details>
