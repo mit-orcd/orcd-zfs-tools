@@ -70,6 +70,9 @@ To verify the applied quota and monitor current usage, use the following native 
 
 **Check assigned limit:**
 ```bash
+
+zfs groupspace <dataset>
+OR
 zfs get groupobjquota@<group_name> <dataset>
 View usage report:
 
