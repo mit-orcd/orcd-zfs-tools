@@ -3,78 +3,68 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Storage: OpenZFS](https://img.shields.io/badge/Storage-OpenZFS-blue.svg)](https://openzfs.org/)
 
-An automated utility for High-Performance Computing (HPC) environments to manage file count limits proportional to storage capacity. This script prevents metadata-heavy workloads from degrading system performance by enforcing a standardized object-to-storage ratio.
+An automated utility for High-Performance Computing (HPC) environments to manage file count limits. This script implements a "Base + Incremental" scaling model to ensure storage systems remain performant while providing users with a high floor for metadata-intensive workloads.
 
 ---
 
 ## 📖 Purpose
 
-In large-scale storage environments, managing disk space is only one half of system health. Excessive file creation (metadata bloat) can severely impact:
-* **System Responsiveness:** Slows down directory listings and file access.
-* **Maintenance Operations:** Increases the time required for `zfs scrub` and resilvering.
-* **Backup Performance:** Drastically increases the overhead for file-based backup solutions.
+To prevent **metadata exhaustion** (performance degradation caused by millions of small files), this script links a group's object count to their disk space allocation. 
 
-This script enforces a **"1 Million Objects per 1 Terabyte"** policy to ensure the storage system remains fast and reliable for all users.
+Unlike a linear scale, this model provides a substantial baseline allowance for every group, with incremental increases as their storage needs grow.
 
 ## ⚙️ Logic & Calculation
 
-The script utilizes a "Ceiling-based" calculation logic. This ensures that users are never penalized for being slightly over a Terabyte boundary and provides a generous buffer for active projects.
+The script utilizes **Ceiling-based rounding** for storage and a two-tier calculation:
 
-### The Calculation Rule
-For every 1 TB (TiB) of storage allocated, the group is granted 1,000,000 objects. The script always rounds the storage quota **up** to the next whole Terabyte.
+1.  **Base Allowance**: 1,000,000 objects.
+2.  **Incremental Scaler**: 100,000 objects for every 1 TB of storage.
 
-**Mathematical Formula:**
+### The Formula
 
-$$\text{Object Limit} = \lceil \frac{\text{Storage Quota in Bytes}}{1,099,511,627,776} \rceil \times 1,000,000$$
+$$\text{Object Limit} = 1,000,000 + (\lceil \frac{\text{Storage Quota in Bytes}}{1,099,511,627,776} \rceil \times 100,000)$$
 
 ### Examples
 
-| Storage Quota | Logic (Rounded Up) | Resulting Object Limit |
+| Storage Quota | Logic (Rounded TB) | Resulting Object Limit |
 | :--- | :--- | :--- |
-| **500 GB** | 1 TB | **1,000,000** |
-| **1.0 TB** | 1 TB | **1,000,000** |
-| **1.3 TB** | 2 TB | **2,000,000** |
-| **5.1 TB** | 6 TB | **6,000,000** |
+| **500 GB** | 1 TB | **1,100,000** |
+| **1.0 TB** | 1 TB | **1,100,000** |
+| **2.5 TB** | 3 TB | **1,300,000** |
+| **10.0 TB** | 10 TB | **2,000,000** |
 
 ---
 
 ## 🚀 Usage Guide
 
 ### Prerequisites
-* **Permissions:** Root/Sudo access is required to set ZFS properties.
-* **Dependencies:** `bc` (for arithmetic) and `getent` (for group verification).
-* **Requirements:** The target dataset must have a `quota` property already defined.
+* **Permissions**: Root/Sudo access is required.
+* **Dependencies**: `getent` (standard on Linux).
+* **Requirements**: Target dataset must have a hard `quota` property defined.
 
-### Running the Script
-1.  **Clone or download** the script to your server.
-2.  **Make it executable**:
-    ```bash
-    chmod +x set_zfs_group_quota.sh
-    ```
-3.  **Execute**:
-    ```bash
-    sudo ./set_zfs_group_quota.sh <dataset_path> <group_name>
-    ```
+### Execution
+```bash
+sudo ./set_zfs_group_quota.sh <dataset_path> <group_name>
 
-### Examples
-* **Auto-calculate based on quota**:
-  `sudo ./set_zfs_group_quota.sh data2/pool/zekai staff`
-* **Manual override**:
-  `sudo ./set_zfs_group_quota.sh data2/pool/zekai staff 5000000`
-
----
+🔍 Monitoring
+Check assigned limit:
+Bash
 
 ## 🔍 Verification
 
 To verify the applied quota and monitor current usage, use the following native ZFS commands:
 
-**Check assigned limit:**
-```bash
 
 zfs groupspace <dataset>
 OR
 zfs get groupobjquota@<group_name> <dataset>
 View usage report:
+
+Bash
+
+zfs groupspace -o name,objused,objquota <dataset>
+---
+
 
 Bash
 zfs groupspace -o name,objused,objquota <dataset>
