@@ -61,7 +61,15 @@ else
     fi
 fi
 
-# 3. q(e) — existing groupobjquota; reconcile with q(n)
+# OBJUSED — floor for object quota (same as objused in groupspace); needed for manual path too
+if [[ -n "$QUOTA_INPUT" ]]; then
+    OBJUSED=$(zfs groupspace -H -p -o name,objused "$DATASET" | grep -w "^$GROUP_NAME" | awk '{print $2}')
+    OBJUSED=${OBJUSED:-0}
+else
+    OBJUSED=$CURRENT_USAGE
+fi
+
+# 3. q(e) — existing groupobjquota; reconcile to effective target
 QE_RAW=$(zfs get -H -p -o value "groupobjquota@${GROUP_NAME}" "$DATASET" 2>/dev/null || true)
 if [[ -z "$QE_RAW" || "$QE_RAW" == "-" || "$QE_RAW" == "none" ]]; then
     QE=0
@@ -69,20 +77,25 @@ else
     QE=$QE_RAW
 fi
 
-# q(e) >= q(n)*1.1 -> keep q(e); q(e) <= q(n)*0.9 -> q(n); else q(e)*1.1
-# Integer-safe: 10*QE >= 11*QN; 10*QE <= 9*QN
-if (( QE * 10 >= QN * 11 )); then
-    FINAL_OBJ_QUOTA=$QE
-    echo "Existing q(e)=$QE >= q(n)*1.1 ($(( QN * 11 / 10 ))); keeping q(e)."
-elif (( QE * 10 <= QN * 9 )); then
-    FINAL_OBJ_QUOTA=$QN
-    echo "Existing q(e)=$QE <= q(n)*0.9 ($(( QN * 9 / 10 ))); using q(n)=$QN."
-else
-    FINAL_OBJ_QUOTA=$(( QE * 11 / 10 ))
-    echo "q(e)=$QE within band around q(n)=$QN; quota = q(e)*1.1 -> $FINAL_OBJ_QUOTA."
+# Target follows q(n) when storage quota changes (up or down), but never below OBJUSED
+FINAL_OBJ_QUOTA=$QN
+if (( OBJUSED > FINAL_OBJ_QUOTA )); then
+    FINAL_OBJ_QUOTA=$OBJUSED
+    echo "Warning: q(n)=$QN is below OBJUSED=$OBJUSED; object quota cannot be below usage; using $FINAL_OBJ_QUOTA."
 fi
 
-# 4. Apply Quota
+if (( FINAL_OBJ_QUOTA == QN )); then
+    echo "Effective object quota target: $FINAL_OBJ_QUOTA (q(n), OBJUSED=$OBJUSED, existing q(e)=$QE)."
+else
+    echo "Effective object quota target: $FINAL_OBJ_QUOTA (q(n)=$QN, OBJUSED=$OBJUSED, existing q(e)=$QE)."
+fi
+
+# 4. Apply Quota (skip if already at target)
+if [[ "$FINAL_OBJ_QUOTA" -eq "$QE" ]]; then
+    echo "groupobjquota@$GROUP_NAME already $FINAL_OBJ_QUOTA on $DATASET; nothing to do."
+    exit 0
+fi
+
 echo "Setting groupobjquota@$GROUP_NAME on $DATASET..."
 zfs set groupobjquota@"$GROUP_NAME"="$FINAL_OBJ_QUOTA" "$DATASET"
 
