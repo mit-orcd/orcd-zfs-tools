@@ -134,9 +134,61 @@ zfs groupspace -o name,objused,objquota <dataset>
 
 ---
 
+## Shared pool provisioning
+
+[`zfs-make-share-pool.sh`](zfs-make-share-pool.sh) creates a **5 TiB shared ZFS dataset** for a PI on the ORCD storage cluster, ensures the Moira group is visible locally, and applies inode quotas via [`zfs-set-group-quota.sh`](zfs-set-group-quota.sh).
+
+### Where to run it
+
+The script is installed on **`mgmt001`** at:
+
+```text
+/root/bin/zfs-make-share-pool.sh
+```
+
+**Run it from `mgmt001`** (SSH to that host first). It SSHes to storage hosts and reaches LDAP helpers via `admin001`; it is not intended to be copied elsewhere or run from a laptop without equivalent access.
+
+### Usage
+
+```bash
+/root/bin/zfs-make-share-pool.sh <PiKerbName>
+```
+
+| Argument | Required | Meaning |
+|----------|----------|---------|
+| `PiKerbName` | Yes | PI Kerberos username (no `pi_` prefix). |
+
+Example:
+
+```bash
+/root/bin/zfs-make-share-pool.sh jdoe
+```
+
+This provisions dataset `<pool>/<PiKerbName>_shared` with group `orcd_rg_shared_pi_<PiKerbName>`.
+
+### Prerequisites
+
+- Run on **`mgmt001`** as a user that can:
+  - SSH to configured storage hosts (`hstor013-n2`, `hstor012-n2`, … — see script `hstors` array).
+  - SSH to **`admin001`**, which in turn reaches **`ldap001`** for Moira LDAP helpers.
+  - Query **`ldap.mit.edu`** for the shared group `orcd_rg_shared_pi_<PiKerbName>` (group must already exist in Moira before the script runs).
+- The PI must **not** already have a `<PiKerbName>_shared` dataset on any configured host.
+- If the PI has a personal pool on one host, that host is chosen; otherwise a host is picked at random from `hstors`.
+
+### What the script does
+
+1. Verifies `<PiKerbName>_shared` does not already exist.
+2. Selects the target storage server (`DZSRV`).
+3. Confirms `orcd_rg_shared_pi_<PiKerbName>` exists in `ldap.mit.edu`.
+4. Adds the group to local Moira LDAP on `ldap001` if `getent group` does not yet see it.
+5. Creates the ZFS dataset, sets **5T** space quota, `chmod 2770`, and `chown root:orcd_rg_shared_pi_<PiKerbName>`.
+6. Runs **`zfs-set-group-quota.sh`** on the storage host for inode limits.
+
+---
+
 ## Other tools
 
-- [`zfs-make-share-pool.sh`](zfs-make-share-pool.sh) — shared pool provisioning across configured hosts (see script usage).
+- [`zfs-make-pool.sh`](zfs-make-pool.sh) — generic personal/group pool provisioning (storage host, size, and PI supplied as arguments).
 
 ---
 
