@@ -286,6 +286,18 @@ The assessment report shows the current naming mode (`Map naming: WWID` or `mpat
 
 **About `zpool create -f`:** OpenZFS refuses a pool whose top-level vdevs differ in redundancy — *mismatched replication level: draid and mirror vdevs with different redundancy, 3 vs. 1* — unless `-f` is given. dRAID3 data plus a 2-way-mirrored NVMe special vdev is exactly that (and the intended design), so the script adds `-f` automatically whenever the special layout's redundancy is below the dRAID parity and prints a note saying so. This does not weaken safety: the script's own in-use check on every selected device runs before `zpool create`. Log devices are exempt from the check; `raidz3x20` or `DRAID_PARITY=2` with `mirror3x6+2spare` need no `-f`.
 
+### ARC sizing
+
+The assessment prints an **ARC sizing** block computed from the host's `MemTotal`, and a successful create writes it to `/etc/modprobe.d/zfs.conf` (backing up any existing file) and applies it live via `/sys/module/zfs/parameters`:
+
+| Parameter | Default | Rationale |
+|-----------|---------|-----------|
+| `zfs_arc_max` | 75% of RAM (`ZFS_ARC_MAX_PCT`) | Dedicated storage node; the OpenZFS default of 50% is for general-purpose hosts. The remaining ~25% covers OS/NFS daemons, dirty data, L2ARC headers (~70 B per cached record, held in ARC) and resilver headroom. |
+| `zfs_arc_min` | 25% of RAM (`ZFS_ARC_MIN_PCT`) | Floor so the ARC is not squeezed away under transient pressure, while leaving room for the OOM-safe worst case. |
+| `zfs_dirty_data_max` | 8 GiB when RAM ≥ 128 GiB (`ZFS_DIRTY_DATA_MAX`) | Larger write buffer so big NFS writes land as fuller 12-disk dRAID stripes per transaction group. |
+
+For a 250 GB node that is about `zfs_arc_max` ≈ 188 GiB and `zfs_arc_min` ≈ 62 GiB (values are rounded down to whole GiB from the actual `MemTotal`). `ZFS_ARC_TUNE=0` skips writing the file. Run `dracut -f` afterwards if the zfs module is in the initramfs. Metadata sits on the special vdev, so leave `zfs_arc_meta_balance` at its default; check `arcstat` `l2hit%` after a few weeks and repurpose the L2ARC NVMe as hot spares if it stays in single digits.
+
 After creation, turn on small-block placement per dataset only when measured: `zfs set special_small_blocks=16K data1/<dataset>`.
 
 ### Reading the dRAID notation
@@ -314,6 +326,7 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 | `DISKS_PER_VDEV=N` | Children per dRAID vdev (default 26; the assessment prints it when it differs). |
 | `HDD_SPARE_COUNT=N` | Extra matched HDDs (taken after the data disks) added as pool hot spares. |
 | `DRAID_MAX_WIDTH=N` | Widest vdev the assessment will propose (default 40). |
+| `ZFS_ARC_TUNE=1\|0`, `ZFS_ARC_MAX_PCT`, `ZFS_ARC_MIN_PCT`, `ZFS_DIRTY_DATA_MAX` | ARC sizing written to `/etc/modprobe.d/zfs.conf` after create (defaults 1 / 75 / 25 / 8 GiB). |
 | `DRY_RUN=1` | Discovery + command + log only. |
 | `POOL=name` | Pool name (default from hostname rule above; always verified interactively). |
 | `SKIP_CONFIRM=1` | No interactive prompts (pool-name verification and the final zpool create confirmation). |

@@ -41,6 +41,11 @@
 #   SKIP_LOG_CACHE=1 Do not reserve 4 NVMe for SLOG mirror + L2ARC (all unused NVMe become eligible for special).
 #   ZPOOL_FORCE=1    Pass -f to zpool create (only after reviewing the in-use pre-check output).
 #   ZFS_ATIME        atime value for the pool root dataset (default: off)
+#   ZFS_ARC_TUNE     1 (default) writes /etc/modprobe.d/zfs.conf with zfs_arc_max/zfs_arc_min/zfs_dirty_data_max
+#                    after a successful create and applies them live via /sys; 0 skips. Sizing from MemTotal:
+#   ZFS_ARC_MAX_PCT  ARC max as % of RAM (default 75 — dedicated storage node)
+#   ZFS_ARC_MIN_PCT  ARC min as % of RAM (default 25)
+#   ZFS_DIRTY_DATA_MAX  bytes (default 8 GiB when RAM >= 128 GiB, else ZFS default)
 #   ORCD_BACKUP_DEST rsync destination for script + pool key after create
 #                    (default: hstor001:/data2/backup/systems/001/<hostname>/; empty string disables)
 #   SPECIAL          Y | layout name — enable special vdev (default layout: mirror10). N/no/0 disables.
@@ -80,6 +85,10 @@ DRY_RUN="${DRY_RUN:-0}"
 SKIP_LOG_CACHE="${SKIP_LOG_CACHE:-0}"
 ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
 HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
+ZFS_ARC_TUNE="${ZFS_ARC_TUNE:-1}"
+ZFS_ARC_MAX_PCT="${ZFS_ARC_MAX_PCT:-75}"
+ZFS_ARC_MIN_PCT="${ZFS_ARC_MIN_PCT:-25}"
+ZFS_DIRTY_DATA_MAX="${ZFS_DIRTY_DATA_MAX:-}"
 HDD_SPARES=()
 ZFS_ATIME="${ZFS_ATIME:-off}"
 # Number of NVMe reserved for SLOG mirror (2) + L2ARC (2); 0 when SKIP_LOG_CACHE=1.
@@ -414,6 +423,18 @@ if ((${#CLI_POSITIONAL[@]} > 0)); then
   set -- "${CLI_POSITIONAL[@]}"
 else
   set --
+fi
+
+for _v in ZFS_ARC_MAX_PCT ZFS_ARC_MIN_PCT; do
+  if ! [[ "${!_v}" =~ ^[0-9]+$ ]] || (( ${!_v} < 1 || ${!_v} > 95 )); then
+    echo "Error: ${_v} must be an integer percent 1..95 (got '${!_v}')." >&2
+    exit 1
+  fi
+done
+unset _v
+if (( ZFS_ARC_MIN_PCT >= ZFS_ARC_MAX_PCT )); then
+  echo "Error: ZFS_ARC_MIN_PCT (${ZFS_ARC_MIN_PCT}) must be below ZFS_ARC_MAX_PCT (${ZFS_ARC_MAX_PCT})." >&2
+  exit 1
 fi
 
 if [[ "$MPATH_SORT" != dm && "$MPATH_SORT" != wwid ]]; then
@@ -1205,6 +1226,93 @@ discover_four_nvme_log_and_cache() {
   discover_nvme_aux_vdevs
 }
 
+# --- ARC sizing (dedicated storage node): arc_max 75% / arc_min 25% of MemTotal, 8 GiB dirty data ---
+ARC_MEM_B=0 ARC_MAX_B=0 ARC_MIN_B=0 ARC_DIRTY_B=0
+compute_arc_sizing() {
+  local kb
+  kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  ARC_MEM_B=$(( ${kb:-0} * 1024 ))
+  (( ARC_MEM_B > 0 )) || return 1
+  ARC_MAX_B=$(( ARC_MEM_B * ZFS_ARC_MAX_PCT / 100 ))
+  ARC_MIN_B=$(( ARC_MEM_B * ZFS_ARC_MIN_PCT / 100 ))
+  # round down to whole GiB
+  ARC_MAX_B=$(( ARC_MAX_B / 1073741824 * 1073741824 ))
+  ARC_MIN_B=$(( ARC_MIN_B / 1073741824 * 1073741824 ))
+  if [[ -n "$ZFS_DIRTY_DATA_MAX" ]]; then
+    ARC_DIRTY_B=$ZFS_DIRTY_DATA_MAX
+  elif (( ARC_MEM_B >= 128 * 1073741824 )); then
+    ARC_DIRTY_B=$(( 8 * 1073741824 ))
+  else
+    ARC_DIRTY_B=0
+  fi
+  return 0
+}
+
+arc_current_value() { # $1 param name → current /sys value or "-"
+  local f="/sys/module/zfs/parameters/$1"
+  [[ -r "$f" ]] && cat "$f" 2>/dev/null || echo "-"
+}
+
+print_arc_sizing() {
+  echo "--- ARC sizing (dedicated storage node) ---"
+  if ! compute_arc_sizing; then
+    echo "  (MemTotal unavailable — cannot size ARC)"
+    echo
+    return 0
+  fi
+  echo "  RAM (MemTotal):     $(human_bytes "$ARC_MEM_B")"
+  printf '  zfs_arc_max:        %-16s (%s, %d%% of RAM; OpenZFS default is 50%%)   current: %s\n' "$ARC_MAX_B" "$(human_bytes "$ARC_MAX_B")" "$ZFS_ARC_MAX_PCT" "$(arc_current_value zfs_arc_max)"
+  printf '  zfs_arc_min:        %-16s (%s, %d%% of RAM; floor under memory pressure)  current: %s\n' "$ARC_MIN_B" "$(human_bytes "$ARC_MIN_B")" "$ZFS_ARC_MIN_PCT" "$(arc_current_value zfs_arc_min)"
+  if (( ARC_DIRTY_B > 0 )); then
+    printf '  zfs_dirty_data_max: %-16s (%s async write buffer; fuller dRAID stripes per txg)  current: %s\n' "$ARC_DIRTY_B" "$(human_bytes "$ARC_DIRTY_B")" "$(arc_current_value zfs_dirty_data_max)"
+  fi
+  echo "  Budget left for OS/NFS/dirty data/L2ARC headers/resilver: $(human_bytes $(( ARC_MEM_B - ARC_MAX_B )))"
+  echo "  /etc/modprobe.d/zfs.conf (written after create when ZFS_ARC_TUNE=1, default):"
+  echo "    options zfs zfs_arc_max=${ARC_MAX_B}"
+  echo "    options zfs zfs_arc_min=${ARC_MIN_B}"
+  (( ARC_DIRTY_B > 0 )) && echo "    options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
+  echo "  Metadata lives on the special vdev → leave zfs_arc_meta_balance default. Review arcstat l2hit% after"
+  echo "  a few weeks; if L2ARC hit rate stays in single digits, repurpose the cache NVMe as hot spares."
+  echo
+}
+
+# Post-create: persist + apply the ARC sizing (backs up an existing zfs.conf first).
+apply_arc_sizing() {
+  local conf=/etc/modprobe.d/zfs.conf ts p
+  if [[ "$ZFS_ARC_TUNE" != "1" ]]; then
+    echo "ZFS_ARC_TUNE=${ZFS_ARC_TUNE} — not writing ${conf}."
+    return 0
+  fi
+  if ! compute_arc_sizing; then
+    echo "Warning: MemTotal unavailable — skipping ARC tuning." >&2
+    return 0
+  fi
+  ts=$(date +%Y%m%d-%H%M%S)
+  if [[ -f "$conf" ]]; then
+    cp -p "$conf" "${conf}.bak-${ts}" && echo "Backed up existing ${conf} → ${conf}.bak-${ts}"
+  fi
+  {
+    echo "# ZFS ARC sizing written by $(basename "$SCRIPT_PATH") on ${ts} (RAM $(human_bytes "$ARC_MEM_B"), pool ${POOL})"
+    echo "# ${ZFS_ARC_MAX_PCT}% / ${ZFS_ARC_MIN_PCT}% of MemTotal; re-run with ZFS_ARC_MAX_PCT/ZFS_ARC_MIN_PCT to change."
+    echo "options zfs zfs_arc_max=${ARC_MAX_B}"
+    echo "options zfs zfs_arc_min=${ARC_MIN_B}"
+    (( ARC_DIRTY_B > 0 )) && echo "options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
+  } >"$conf" || { echo "Warning: could not write ${conf}." >&2; return 0; }
+  echo "Wrote ${conf}:"
+  sed 's/^/  /' "$conf"
+  for p in "zfs_arc_max=${ARC_MAX_B}" "zfs_arc_min=${ARC_MIN_B}"; do
+    if [[ -w "/sys/module/zfs/parameters/${p%%=*}" ]]; then
+      echo "${p#*=}" >"/sys/module/zfs/parameters/${p%%=*}" 2>/dev/null && echo "Applied live: ${p}" || echo "Warning: could not apply ${p} live (takes effect after reboot)." >&2
+    fi
+  done
+  if (( ARC_DIRTY_B > 0 )) && [[ -w /sys/module/zfs/parameters/zfs_dirty_data_max ]]; then
+    if echo "$ARC_DIRTY_B" >/sys/module/zfs/parameters/zfs_dirty_data_max 2>/dev/null; then
+      echo "Applied live: zfs_dirty_data_max=${ARC_DIRTY_B}"
+    fi
+  fi
+  echo "Note: run 'dracut -f' if the zfs module is part of the initramfs, so the values also apply at early boot."
+}
+
 # --- Read-only assessment (./zfs-draid.sh with no vendor pattern) ---
 human_bytes() {
   awk -v b="${1:-0}" 'BEGIN {
@@ -1818,6 +1926,8 @@ run_storage_assessment() {
       echo
     fi
 
+    print_arc_sizing
+
     echo "--- Notes ---"
     echo "  After create, enable small blocks per dataset only when measured, e.g.:"
     echo "    zfs set special_small_blocks=16K ${POOL}/dataset"
@@ -2104,6 +2214,8 @@ fi
 zfs list 2>&1 | tee -a "$POOL_SETUP_LOG" || true
 
 systemctl enable "zfs-scrub-monthly@${POOL}.timer" --now 2>&1 | tee -a "$POOL_SETUP_LOG" || echo "Warning: could not enable zfs-scrub-monthly@${POOL}.timer" | tee -a "$POOL_SETUP_LOG"
+
+apply_arc_sizing 2>&1 | tee -a "$POOL_SETUP_LOG"
 
 if [[ -z "$_orcd_dest" ]]; then
   echo "ORCD_BACKUP_DEST is empty — skipping rsync of script/key." | tee -a "$POOL_SETUP_LOG"
