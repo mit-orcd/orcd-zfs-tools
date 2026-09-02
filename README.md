@@ -277,8 +277,10 @@ The assessment report shows the current naming mode (`Map naming: WWID` or `mpat
 |------|---------|
 | Data | `total_hdd_count / DISKS_PER_VDEV` dRAID vdevs (default 26 wide). Layout auto-computed per vdev: parity `DRAID_PARITY` (3), profile `balanced` (≥2 redundancy groups, D≈8) and **at least 1 distributed spare** (`DRAID_MIN_SPARES`). 78 disks → `3 × draid3:9d:26c:2s`. Fix a literal with `DRAID_VDEV_SPEC=draid3:9d:26c:2s`. |
 | Log / cache | 4 smallest unused NVMe: 2× SLOG mirror + 2× L2ARC. `SKIP_LOG_CACHE=1` to omit. |
-| Special | Largest unused NVMe after log/cache; layouts via `--special=<layout>` (`--help-special`): `mirror10` (default, 20 NVMe), `mirror9+2spare`, `mirror8`, `mirror5`, and raidz variants (not recommended). `SPECIAL_PATTERN=7600` restricts to one model. |
+| Special | Largest unused NVMe after log/cache; layouts via `--special=<layout>` (`--help-special`): `mirror10` (default, 20 NVMe), `mirror9+2spare`, `mirror8`, `mirror5`, `mirror3x6+2spare` (6× 3-way mirrors), and raidz variants (not recommended). `SPECIAL_PATTERN=7600` restricts to one model. |
 | Pool props | `ashift=12 autoexpand=on autoreplace=on autotrim=on`, `acltype=posixacl xattr=sa dnodesize=auto atime=off compression=lz4 dedup=off` (`ZFS_ATIME=on` to change). |
+
+**About `zpool create -f`:** OpenZFS refuses a pool whose top-level vdevs differ in redundancy — *mismatched replication level: draid and mirror vdevs with different redundancy, 3 vs. 1* — unless `-f` is given. dRAID3 data plus a 2-way-mirrored NVMe special vdev is exactly that (and the intended design), so the script adds `-f` automatically whenever the special layout's redundancy is below the dRAID parity and prints a note saying so. This does not weaken safety: the script's own in-use check on every selected device runs before `zpool create`. Log devices are exempt from the check; `raidz3x20` or `DRAID_PARITY=2` with `mirror3x6+2spare` need no `-f`.
 
 After creation, turn on small-block placement per dataset only when measured: `zfs set special_small_blocks=16K data1/<dataset>`.
 

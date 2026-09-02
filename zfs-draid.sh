@@ -202,13 +202,22 @@ Special vdev layouts (enable with SPECIAL=Y, --special[=layout], or SPECIAL_VDEV
   raidz2-18+2spare 20       special raidz2×18 + spare ×2     18 NVMe raidz2 (~16× capacity); 2 pool hot spares.
                                (18+2)                         More special TB; tolerates 2 failures in special vdev.
 
+  mirror3x6+2spare 20       special + 6× 3-way mirror        18 NVMe in 6 triple mirrors (6× capacity); 2 pool hot
+                               + spare ×2 (18+2)              spares. Each mirror survives 2 failures; still needs -f
+                                                              next to dRAID3 (3 vs 2), no -f next to dRAID2.
+
+Replication-level note: OpenZFS refuses "draidN + lower-redundancy special" without -f (mismatched
+  replication level). The script adds -f automatically for that case — expected, not an error. The
+  in-use safety check runs before zpool create regardless of -f.
+
 Discovery (DATA_DISK_SOURCE=mpath):
   - 4 smallest unused whole-disk NVMe by-id paths → 2× SLOG mirror + 2× L2ARC cache
   - Largest remaining NVMe (optionally filtered by SPECIAL_PATTERN) → special vdev (+ pool spares if layout includes +2spare)
   - Requires 4 + (layout NVMe total) unused NVMe (e.g. 24 for mirror10 or mirror9+2spare on R284: 4×7500 + 20×7600)
 
 Aliases: default, recommended → mirror10; conservative → mirror5; staged → mirror8;
-          raidz2 → raidz2x10; raidz3 → raidz3x20; mirror9 → mirror9+2spare; raidz2-18 → raidz2-18+2spare
+          raidz2 → raidz2x10; raidz3 → raidz3x20; mirror9 → mirror9+2spare; raidz2-18 → raidz2-18+2spare;
+          mirror3 | mirror3x6 → mirror3x6+2spare
 
 After pool create, enable small blocks per dataset only when measured (e.g. zfs set special_small_blocks=16K pool/dataset).
 EOF
@@ -252,6 +261,7 @@ normalize_special_layout() {
     raidz3 | raidz3x20) echo "raidz3x20" ;;
     mirror9 | mirror9x2spare | mirror9+2spare) echo "mirror9+2spare" ;;
     raidz2-18 | raidz2x18 | raidz2x18+2spare | raidz2-18+2spare) echo "raidz2-18+2spare" ;;
+    mirror3 | mirror3x6 | mirror3x6+2spare) echo "mirror3x6+2spare" ;;
     *)
       echo "Error: unknown special vdev layout '${1}' (try --help-special)." >&2
       return 1
@@ -268,6 +278,7 @@ special_layout_special_disk_count() {
     raidz3x20) echo 20 ;;
     mirror9+2spare) echo 18 ;;
     raidz2-18+2spare) echo 18 ;;
+    mirror3x6+2spare) echo 18 ;;
     *)
       echo "Error: unknown special vdev layout '${1}'." >&2
       return 1
@@ -277,7 +288,7 @@ special_layout_special_disk_count() {
 
 special_layout_pool_spare_count() {
   case "$1" in
-    mirror9+2spare | raidz2-18+2spare) echo 2 ;;
+    mirror9+2spare | raidz2-18+2spare | mirror3x6+2spare) echo 2 ;;
     mirror10 | mirror5 | mirror8 | raidz2x10 | raidz3x20) echo 0 ;;
     *)
       echo "Error: unknown special vdev layout '${1}'." >&2
@@ -293,6 +304,16 @@ special_layout_nvme_total() {
   echo $((special + spares))
 }
 
+# Disk failures a single special vdev member group survives (mirror pair 1, 3-way 2, raidz2 2, raidz3 3).
+special_layout_redundancy() {
+  case "$1" in
+    mirror10 | mirror5 | mirror8 | mirror9+2spare) echo 1 ;;
+    mirror3x6+2spare | raidz2x10 | raidz2-18+2spare) echo 2 ;;
+    raidz3x20) echo 3 ;;
+    *) echo 0 ;;
+  esac
+}
+
 special_layout_summary() {
   case "$1" in
     mirror10) echo "10× mirror (20 NVMe) — recommended default" ;;
@@ -302,6 +323,7 @@ special_layout_summary() {
     raidz3x20) echo "1× raidz3×20 (20 NVMe) — parity-matched, not recommended" ;;
     mirror9+2spare) echo "9× mirror (18 NVMe) + 2 pool hot spares" ;;
     raidz2-18+2spare) echo "raidz2×18 (18 NVMe) + 2 pool hot spares" ;;
+    mirror3x6+2spare) echo "6× 3-way mirror (18 NVMe) + 2 pool hot spares" ;;
     *) echo "$1" ;;
   esac
 }
@@ -906,6 +928,11 @@ append_special_vdev_to_zpool_cmd() {
     raidz2-18+2spare)
       _zpool_cmd+=(raidz2 "${disks[@]}")
       ;;
+    mirror3x6+2spare)
+      for ((i = 0; i < need; i += 3)); do
+        _zpool_cmd+=(mirror "${disks[i]}" "${disks[i + 1]}" "${disks[i + 2]}")
+      done
+      ;;
     *)
       echo "Error: unsupported special layout '${layout}'." >&2
       return 1
@@ -1276,6 +1303,7 @@ assess_special_usable_bytes() {
     raidz2x10) echo $((16 * disk_b)) ;;
     raidz3x20) echo $((17 * disk_b)) ;;
     raidz2-18+2spare) echo $((16 * disk_b)) ;;
+    mirror3x6+2spare) echo $((6 * disk_b)) ;;
     *) echo 0 ;;
   esac
 }
@@ -1347,7 +1375,7 @@ assess_print_special_feasibility() {
     echo "    Add 10–20 same-size NVMe (typically 7.68T class) for a special vdev."
   else
     echo "  Special layouts that fit (largest unused NVMe tier, after 4 for log+cache):"
-    for layout in mirror10 mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20; do
+    for layout in mirror10 mirror9+2spare mirror8 mirror5 mirror3x6+2spare raidz2-18+2spare raidz2x10 raidz3x20; do
       nvme_n=$(special_layout_nvme_total "$layout") || continue
       if (( nvme_n <= special_fit )); then
         need=$((4 + nvme_n))
@@ -1411,7 +1439,7 @@ run_storage_assessment() {
   {
     host=$(hostname)
     ASSESS_SELF="./$(basename "$SCRIPT_PATH")"
-    layout_order=(mirror10 mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20)
+    layout_order=(mirror10 mirror9+2spare mirror8 mirror5 mirror3x6+2spare raidz2-18+2spare raidz2x10 raidz3x20)
     ASSESS_RANK=0
     mpath_rows=()
     nvme_rows=()
@@ -1925,7 +1953,22 @@ if [[ "${ZPOOL_DEV_NAMES:-short}" != short && "${ZPOOL_DEV_NAMES:-short}" != ful
 fi
 
 _zpool_cmd=(zpool create)
-[[ "$ZPOOL_FORCE" == "1" ]] && _zpool_cmd+=(-f)
+_force_reason=""
+[[ "$ZPOOL_FORCE" == "1" ]] && _force_reason="ZPOOL_FORCE=1"
+# OpenZFS rejects a pool whose top-level vdevs have different redundancy ("mismatched replication level:
+# draid and mirror vdevs with different redundancy, 3 vs. 1") unless -f is given. dRAID3 data + mirrored
+# NVMe special is the intended design here, so add -f for that case. Log devices are exempt from the check.
+if (( SPECIAL_ENABLED )); then
+  _sp_red=$(special_layout_redundancy "$SPECIAL_LAYOUT")
+  if (( _sp_red < DRAID_PARITY )); then
+    _force_reason="${_force_reason:+${_force_reason}; }special ${SPECIAL_LAYOUT} redundancy ${_sp_red} < dRAID parity ${DRAID_PARITY} (mismatched replication level)"
+  fi
+  unset _sp_red
+fi
+if [[ -n "$_force_reason" ]]; then
+  _zpool_cmd+=(-f)
+  echo "Note: zpool create -f — ${_force_reason}. Expected for this design; the in-use safety check above still applies."
+fi
 _zpool_cmd+=("$POOL"
   -o ashift=12
   -o autoexpand=on
