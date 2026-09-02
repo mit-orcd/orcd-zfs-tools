@@ -262,12 +262,13 @@ offer_destroy_existing_pool() {
   echo
   echo "A pool named '${pool}' already exists on this host (${state})."
   if [[ "$state" == imported ]]; then
-    zpool status "$pool" 2>/dev/null | sed 's/^/  /' | head -n 40
-    echo "  …"
-    zpool list "$pool" 2>/dev/null | sed 's/^/  /'
-    zfs list -r "$pool" 2>/dev/null | sed 's/^/  /' | head -n 20
+    # Truncate with awk (reads all input) — `head` would SIGPIPE zpool and, with set -e/pipefail,
+    # abort the script before the destroy question is ever asked.
+    zpool status "$pool" 2>/dev/null | awk 'NR <= 40 { print "  " $0 } END { if (NR > 40) print "  … (" NR - 40 " more lines)" }' || true
+    zpool list "$pool" 2>/dev/null | sed 's/^/  /' || true
+    zfs list -r "$pool" 2>/dev/null | awk 'NR <= 20 { print "  " $0 } END { if (NR > 20) print "  … (" NR - 20 " more datasets)" }' || true
   else
-    zpool import 2>/dev/null | sed 's/^/  /' | head -n 20
+    zpool import 2>/dev/null | awk 'NR <= 20 { print "  " $0 }' || true
   fi
   echo
 
@@ -774,7 +775,7 @@ collect_multipath_maps_matching() {
     [[ -n "$stanza" ]] || return 0
     ll=$(echo "$stanza" | tr '[:upper:]' '[:lower:]')
     [[ "$ll" == *"${pat_lc}"* ]] || return 0
-    hdr=$(printf '%s\n' "$stanza" | head -n1)
+    hdr=${stanza%%$'\n'*}
     wwid=$(extract_wwid_from_mpath_header "$hdr")
     [[ -n "$wwid" ]] || return 0
     dmn=""
@@ -1894,8 +1895,8 @@ run_storage_assessment() {
     echo
 
     if ((${#nvme_sz_unused[@]} > 0)); then
-      small_sz=$(printf '%s\n' "${!nvme_sz_unused[@]}" | sort -n | head -n1)
-      large_sz=$(printf '%s\n' "${!nvme_sz_unused[@]}" | sort -n | tail -n1)
+      small_sz=$(printf '%s\n' "${!nvme_sz_unused[@]}" | sort -n | awk 'NR == 1')
+      large_sz=$(printf '%s\n' "${!nvme_sz_unused[@]}" | sort -n | awk 'END { print }')
       small_n=${nvme_sz_unused[$small_sz]:-0}
       large_n=${nvme_sz_unused[$large_sz]:-0}
     fi
