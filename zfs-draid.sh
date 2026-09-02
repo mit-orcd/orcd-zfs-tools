@@ -17,8 +17,9 @@
 #   zfs-draid.sh SEAGATE                   # 78 disks → 3×26 dRAID vdevs (mpath; layout auto from DRAID_PARITY)
 #   zfs-draid.sh SEAGATE 52                # 52 disks → 2×26
 #   DRAID_VDEV_SPEC=draid3:9d:26c:2s zfs-draid.sh SEAGATE 78   # restore fixed 26-disk dRAID3 tuple from older script
-#   SPECIAL=Y DRY_RUN=1 zfs-draid.sh SEAGATE 78                # + default special vdev (10× mirror, 20 NVMe)
-#   zfs-draid.sh --special=mirror5 SEAGATE 78                  # conservative special vdev (5× mirror, 10 NVMe)
+#   SPECIAL=Y DRY_RUN=1 zfs-draid.sh SEAGATE 78                # + default special vdev (10 NVMe → mirror5)
+#   CACHE=N zfs-draid.sh --special=mirror3x3+1spare SEAGATE 78 # 3× 3-way mirror special, no L2ARC
+#   zfs-draid.sh --special=mirror10 SEAGATE 78                 # all 20 NVMe as 10 mirror pairs
 #   zfs-draid.sh --special=mirror3x6+2spare SEAGATE 78         # 6× 3-way mirror special (extra redundancy) + 2 spares
 #   zfs-draid.sh --special=mirror9+2spare SEAGATE 78           # 9× mirror special + 2 pool hot spares
 #   zfs-draid.sh --special=raidz2-18+2spare SEAGATE 78         # raidz2×18 special + 2 pool hot spares
@@ -38,7 +39,7 @@
 #   DISKS_PER_VDEV   Disks per dRAID child vdev (mpath default: 26; nvme default: total_hdd_count)
 #   HDD_SPARE_COUNT  Extra matched HDDs (after the data disks) added as pool hot spares (default 0)
 #   DRAID_MAX_WIDTH  Assessment: widest vdev it will propose (default 40)
-#   SKIP_LOG_CACHE=1 Do not reserve 4 NVMe for SLOG mirror + L2ARC (all unused NVMe become eligible for special).
+#   SKIP_LOG_CACHE=1 Same as SLOG=N CACHE=N.
 #   ZPOOL_FORCE=1    Pass -f to zpool create (only after reviewing the in-use pre-check output).
 #   ZFS_ATIME        atime value for the pool root dataset (default: off)
 #   ZFS_ARC_TUNE     1 (default) writes /etc/modprobe.d/zfs.conf with zfs_arc_max/zfs_arc_min/zfs_dirty_data_max
@@ -48,7 +49,14 @@
 #   ZFS_DIRTY_DATA_MAX  bytes (default 8 GiB when RAM >= 128 GiB, else ZFS default)
 #   ORCD_BACKUP_DEST rsync destination for script + pool key after create
 #                    (default: hstor001:/data2/backup/systems/001/<hostname>/; empty string disables)
-#   SPECIAL          Y | layout name — enable special vdev (default layout: mirror10). N/no/0 disables.
+#   SPECIAL          Y | layout name — enable special vdev. N/no/0 disables. Y = SPECIAL_NVME_COUNT NVMe as
+#                    SPECIAL_MIRROR_WAY-way mirrors (default 10 NVMe → mirror5). Generic syntax: mirror<G>,
+#                    mirror3x<G>, optional +<S>spare (e.g. mirror3x3+1spare, mirror3x6+2spare). --help-special.
+#   SPECIAL_NVME_COUNT  NVMe used by the default special layout (default 10); the rest stay free.
+#   SPECIAL_MIRROR_WAY  2 (default) or 3 — mirror width for the default layout.
+#   SLOG=Y|N  CACHE=Y|N  SLOG mirror (2 smallest NVMe) / L2ARC (next 2). Defaults Y; CACHE=N is common.
+#   DESTROY_EXISTING=1  With SKIP_CONFIRM=1, destroy an existing same-name pool without prompting.
+#                    Interactive runs always show the pool and ask twice (y/N, then type the pool name).
 #   SPECIAL_VDEV     Same as SPECIAL when set to a layout name; overrides SPECIAL=Y default.
 #   SPECIAL_PATTERN  Optional substring filter for NVMe chosen as special (default: largest unused after log/cache).
 #   DRY_RUN=1        Print discovery, layout, command, and log preamble only (no mpathconf / zpool create)
@@ -83,6 +91,12 @@ DRAID_VDEV_SPEC="${DRAID_VDEV_SPEC:-}"
 DRAID_MIN_SPARES="${DRAID_MIN_SPARES:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 SKIP_LOG_CACHE="${SKIP_LOG_CACHE:-0}"
+SLOG="${SLOG:-Y}"
+CACHE="${CACHE:-Y}"
+[[ "$SKIP_LOG_CACHE" == "1" ]] && { SLOG=N; CACHE=N; }
+SPECIAL_NVME_COUNT="${SPECIAL_NVME_COUNT:-10}"
+SPECIAL_MIRROR_WAY="${SPECIAL_MIRROR_WAY:-2}"
+DESTROY_EXISTING="${DESTROY_EXISTING:-0}"
 ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
 HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
 ZFS_ARC_TUNE="${ZFS_ARC_TUNE:-1}"
@@ -91,9 +105,10 @@ ZFS_ARC_MIN_PCT="${ZFS_ARC_MIN_PCT:-25}"
 ZFS_DIRTY_DATA_MAX="${ZFS_DIRTY_DATA_MAX:-}"
 HDD_SPARES=()
 ZFS_ATIME="${ZFS_ATIME:-off}"
-# Number of NVMe reserved for SLOG mirror (2) + L2ARC (2); 0 when SKIP_LOG_CACHE=1.
-AUX_NVME_COUNT=4
-[[ "$SKIP_LOG_CACHE" == "1" ]] && AUX_NVME_COUNT=0
+# NVMe reserved for auxiliary vdevs: 2 for the SLOG mirror (SLOG=Y) + 2 for L2ARC (CACHE=Y).
+AUX_NVME_COUNT=0
+[[ "${SLOG^^}" == Y ]] && AUX_NVME_COUNT=$((AUX_NVME_COUNT + 2))
+[[ "${CACHE^^}" == Y ]] && AUX_NVME_COUNT=$((AUX_NVME_COUNT + 2))
 NVME_LOG=()
 NVME_CACHE=()
 MPATH_SORT="${MPATH_SORT:-dm}"
@@ -154,79 +169,191 @@ valid_zpool_name() {
 prompt_verify_pool_name() {
   local r
   echo "Pool name:         ${POOL}   (source: ${POOL_NAME_SOURCE})"
-  pool_must_not_exist "$POOL"
   if [[ "${SKIP_CONFIRM:-0}" == "1" ]]; then
     echo "SKIP_CONFIRM=1 — using pool name '${POOL}' without asking."
-    return 0
-  fi
-  if [[ ! -t 0 ]]; then
+  elif [[ ! -t 0 ]]; then
     echo "Note: stdin is not a terminal — using pool name '${POOL}' (set POOL= to override)."
+  else
+    while :; do
+      read -r -p "Verify pool name — press Enter to keep '${POOL}', or type another name: " r || true
+      r="${r//[[:space:]]/}"
+      if [[ -z "$r" ]]; then
+        break
+      fi
+      if valid_zpool_name "$r"; then
+        POOL="$r"
+        POOL_NAME_SOURCE="entered at prompt"
+        break
+      fi
+      echo "  '${r}' is not a valid pool name (letters/digits/_ . : -, must start with a letter, not a vdev keyword)." >&2
+    done
+    echo "Using pool name:   ${POOL}"
+  fi
+  # Existing pool with this name? Offer destroy + cleanup (interactive: asks twice), else continue.
+  pool_must_not_exist "$POOL"
+}
+
+# --- Existing pool with the same name: offer destroy + cleanup, then continue with the new create ---
+# Members of a pool scheduled for destruction are exempted from the in-use pre-check (DESTROY_MEMBERS).
+declare -A DESTROY_MEMBERS=()
+DESTROY_PENDING_POOL=""
+
+existing_pool_state() { # $1 pool → "imported" | "exported" | ""
+  command -v zpool >/dev/null 2>&1 || return 0
+  if zpool list -H -o name 2>/dev/null | grep -qx -- "$1"; then
+    echo imported
+  elif zpool import 2>/dev/null | awk '$1 == "pool:" {print $2}' | grep -qx -- "$1"; then
+    echo exported
+  fi
+}
+
+# Leaf devices of a pool (full paths). zpool status -P prints /dev/... for real devices; dRAID
+# distributed spares (draid3-0-0) and vdev headers have no path and are skipped.
+pool_member_devices() {
+  zpool status -P "$1" 2>/dev/null | awk '$1 ~ /^\/dev\// {print $1}'
+}
+
+destroy_existing_pool() { # $1 pool (already imported)
+  local pool=$1 dev logf ts
+  local -a members=()
+  ts=$(date +%Y%m%d-%H%M%S)
+  mkdir -p /var/log/zfs-orcd 2>/dev/null || true
+  logf="/var/log/zfs-orcd/zfs-orcd-${pool}-destroy-${ts}.log"
+  : >"$logf" 2>/dev/null || logf="/tmp/zfs-orcd-${pool}-destroy-${ts}.log"
+  mapfile -t members < <(pool_member_devices "$pool")
+  {
+    echo "=== destroy pool '${pool}' — $(date -Is 2>/dev/null || date) ==="
+    zpool status -P "$pool" 2>&1 || true
+    echo
+    echo "--- zpool destroy -f ${pool} ---"
+  } >>"$logf"
+  echo "Destroying pool '${pool}' (${#members[@]} member devices) — log: ${logf}"
+  if ! zpool destroy -f "$pool" 2>&1 | tee -a "$logf"; then
+    echo "Error: zpool destroy ${pool} failed (see ${logf}). Check 'zfs list' / mounts / open datasets." >&2
+    exit 1
+  fi
+  echo "--- labelclear / wipefs on former members ---" >>"$logf"
+  for dev in ${members[@]+"${members[@]}"}; do
+    [[ -b "$dev" ]] || continue
+    zpool labelclear -f "$dev" >>"$logf" 2>&1 || true
+    if command -v wipefs >/dev/null 2>&1; then
+      wipefs -a "$dev" >>"$logf" 2>&1 || true
+    fi
+    echo "  cleared ${dev}" | tee -a "$logf"
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "zfs-scrub-monthly@${pool}.timer" >>"$logf" 2>&1 || true
+  fi
+  if command -v udevadm >/dev/null 2>&1; then udevadm settle 2>/dev/null || true; fi
+  {
+    echo "--- after ---"
+    zpool list 2>&1 || true
+  } >>"$logf"
+  echo "Pool '${pool}' destroyed; ${#members[@]} devices label-cleared and wiped. Continuing with the new create."
+  DESTROY_PENDING_POOL=""
+}
+
+# Called from the pool-name prompt. DRY_RUN: only record the members so the dry run can complete.
+offer_destroy_existing_pool() {
+  local pool=$1 state r dev
+  state=$(existing_pool_state "$pool")
+  [[ -n "$state" ]] || return 0
+
+  echo
+  echo "A pool named '${pool}' already exists on this host (${state})."
+  if [[ "$state" == imported ]]; then
+    zpool status "$pool" 2>/dev/null | sed 's/^/  /' | head -n 40
+    echo "  …"
+    zpool list "$pool" 2>/dev/null | sed 's/^/  /'
+    zfs list -r "$pool" 2>/dev/null | sed 's/^/  /' | head -n 20
+  else
+    zpool import 2>/dev/null | sed 's/^/  /' | head -n 20
+  fi
+  echo
+
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "DRY_RUN=1 — the pool is NOT destroyed. A real run will ask whether to destroy it first."
+    if [[ "$state" == imported ]]; then
+      while IFS= read -r dev; do
+        [[ -n "$dev" ]] && DESTROY_MEMBERS[$(readlink -f "$dev")]=1
+      done < <(pool_member_devices "$pool")
+      echo "Its ${#DESTROY_MEMBERS[@]} member devices are treated as free for this dry run."
+    fi
+    DESTROY_PENDING_POOL=$pool
+    echo
     return 0
   fi
-  while :; do
-    read -r -p "Verify pool name — press Enter to keep '${POOL}', or type another name: " r || true
-    r="${r//[[:space:]]/}"
-    if [[ -z "$r" ]]; then
-      break
+
+  if [[ ! -t 0 ]]; then
+    if [[ "${DESTROY_EXISTING}" == "1" && "${SKIP_CONFIRM:-0}" == "1" ]]; then
+      echo "DESTROY_EXISTING=1 SKIP_CONFIRM=1 — destroying '${pool}' without prompting."
+    else
+      echo "Error: pool '${pool}' exists and stdin is not a terminal. Re-run interactively, or set" >&2
+      echo "       DESTROY_EXISTING=1 SKIP_CONFIRM=1 to destroy it non-interactively, or choose another POOL=." >&2
+      exit 1
     fi
-    if valid_zpool_name "$r"; then
-      POOL="$r"
-      POOL_NAME_SOURCE="entered at prompt"
-      break
+  else
+    echo "!!! DESTROYING '${pool}' DELETES ALL DATA ON IT — every dataset, snapshot and file. !!!"
+    read -r -p "Destroy pool '${pool}' and wipe its member devices so a new pool can be created? [y/N] " r || true
+    case "${r,,}" in
+      y | yes) ;;
+      *) echo "Keeping existing pool '${pool}'. Choose another name with POOL= or re-run to destroy." >&2; exit 2 ;;
+    esac
+    read -r -p "Second confirmation — type the pool name (${pool}) exactly to proceed: " r || true
+    if [[ "$r" != "$pool" ]]; then
+      echo "Pool name did not match — nothing destroyed." >&2
+      exit 2
     fi
-    echo "  '${r}' is not a valid pool name (letters/digits/_ . : -, must start with a letter, not a vdev keyword)." >&2
-  done
-  pool_must_not_exist "$POOL"
-  echo "Using pool name:   ${POOL}"
+  fi
+
+  if [[ "$state" == exported ]]; then
+    echo "Importing exported pool '${pool}' (no mount) so it can be destroyed cleanly…"
+    if ! zpool import -N -f "$pool" 2>&1; then
+      echo "Error: could not import '${pool}' for destruction. Clear its labels manually (zpool labelclear -f <dev>)." >&2
+      exit 1
+    fi
+  fi
+  destroy_existing_pool "$pool"
 }
 
 pool_must_not_exist() {
-  if command -v zpool >/dev/null 2>&1 && zpool list -H -o name 2>/dev/null | grep -qx -- "$1"; then
-    echo "Error: a pool named '${1}' already exists on this host (zpool list). Choose another name with POOL=." >&2
-    exit 1
-  fi
+  offer_destroy_existing_pool "$1"
 }
 
 special_layout_help() {
-  cat <<'EOF'
+  cat <<EOF
 Special vdev layouts (enable with SPECIAL=Y, --special[=layout], or SPECIAL_VDEV=layout):
 
-  Layout       NVMe disks   zpool fragment (conceptual)     Notes
-  ---------    ----------   -----------------------------     -----
-  mirror10     20           special + 10× mirror pairs       DEFAULT / recommended (max special capacity:
-               (default)                                      metadata + moderate special_small_blocks).
+  Generic mirror syntax:   mirror<G>              G x 2-way mirror pairs   (mirror5      = 10 NVMe)
+                           mirror3x<G>            G x 3-way mirrors        (mirror3x3    =  9 NVMe)
+                           ...+<S>spare           + S NVMe as pool hot spares (mirror3x6+2spare = 20 NVMe)
+  Fixed raidz layouts:     raidz2x10 (2 x raidz2 of 10), raidz3x20 (1 x raidz3 of 20), raidz2-18+2spare
+                           - capacity-biased, not recommended for the special vdev.
 
-  mirror3x6+2spare 20       special + 6× 3-way mirror        RECOMMENDED for extra redundancy: each mirror
-                               + spare ×2 (18+2)              survives 2 NVMe failures; 6× capacity; 2 hot spares.
+  DEFAULT (--special / SPECIAL=Y): SPECIAL_NVME_COUNT=${SPECIAL_NVME_COUNT} NVMe as ${SPECIAL_MIRROR_WAY}-way mirrors ->
+      $(special_layout_from_count "$SPECIAL_NVME_COUNT" "$SPECIAL_MIRROR_WAY")
+      (SPECIAL_NVME_COUNT=N / SPECIAL_MIRROR_WAY=2|3 change it; an uneven count leaves the remainder as
+      pool hot spares). NVMe not used by the special vdev stay free for a later "zpool add".
 
-  mirror5      10           special + 5× mirror pairs        Conservative metadata-only; leaves 10 NVMe free
-                                                                for later "zpool add special mirror …".
+  Recommended on a 20 x 7.68T + 4 x 800G node:
+      mirror5            10 NVMe   5 pairs                      default; 10 NVMe left free
+      mirror3x3+1spare   10 NVMe   3 triple mirrors + 1 spare   extra redundancy (each mirror survives 2 failures)
+      mirror10           20 NVMe   10 pairs                     max special capacity
+      mirror3x6+2spare   20 NVMe   6 triple mirrors + 2 spares  extra redundancy, all NVMe used
 
-  mirror8      16           special + 8× mirror pairs        Staged rollout; add more mirror pairs later.
-
-  raidz2x10    20           special + raidz2×10 + raidz2×10  Higher special capacity; worse latency/rebuild
-                                                                than mirrors — not recommended for production.
-
-  raidz3x20    20           special + raidz3×20              Parity-matched to dRAID3; still prefer mirrors.
-
-  mirror9+2spare  20        special + 9× mirror + spare ×2   18 NVMe in special (9 pairs); 2 pool hot spares.
-                               (18+2)                         Good balance of mirror latency + hot spares.
-
-  raidz2-18+2spare 20       special raidz2×18 + spare ×2     18 NVMe raidz2 (~16× capacity); 2 pool hot spares.
-                               (18+2)                         More special TB; tolerates 2 failures in special vdev.
+  Auxiliary NVMe (smallest first): SLOG mirror (2) when SLOG=Y (default), L2ARC (2) when CACHE=Y (default).
+  CACHE=N drops the L2ARC (2 NVMe stay free); SLOG=N drops the log mirror; SKIP_LOG_CACHE=1 = both.
 
 Replication-level note: OpenZFS refuses "draidN + lower-redundancy special" without -f (mismatched
-  replication level). The script adds -f automatically for that case — expected, not an error. The
+  replication level). The script adds -f automatically for that case - expected, not an error. The
   in-use safety check runs before zpool create regardless of -f.
 
 Discovery (DATA_DISK_SOURCE=mpath):
-  - 4 smallest unused whole-disk NVMe by-id paths → 2× SLOG mirror + 2× L2ARC cache
-  - Largest remaining NVMe (optionally filtered by SPECIAL_PATTERN) → special vdev (+ pool spares if layout includes +2spare)
-  - Requires 4 + (layout NVMe total) unused NVMe (e.g. 24 for mirror10 or mirror9+2spare on R284: 4×7500 + 20×7600)
+  - smallest unused whole-disk NVMe -> SLOG mirror / L2ARC (per SLOG / CACHE)
+  - largest remaining NVMe (optionally filtered by SPECIAL_PATTERN) -> special vdev (+ pool spares per layout)
 
-Aliases: default, recommended → mirror10; conservative → mirror5; staged → mirror8;
-          raidz2 → raidz2x10; raidz3 → raidz3x20; mirror9 → mirror9+2spare; raidz2-18 → raidz2-18+2spare;
-          mirror3 | mirror3x6 → mirror3x6+2spare
+Aliases: default | recommended -> derived from SPECIAL_NVME_COUNT/SPECIAL_MIRROR_WAY; conservative -> mirror5;
+         staged -> mirror8; mirror9 -> mirror9+2spare; raidz2 -> raidz2x10; raidz3 -> raidz3x20; raidz2-18 -> raidz2-18+2spare
 
 After pool create, enable small blocks per dataset only when measured (e.g. zfs set special_small_blocks=16K pool/dataset).
 EOF
@@ -242,7 +369,7 @@ usage() {
   echo "  -h, --help              Show this help"
   echo "      --help-special      Show special vdev layout choices"
   echo "  -A, --assess            Force assessment report (also the default when no pattern is given)"
-  echo "  -S, --special[=layout]  Enable special vdev (layout defaults to mirror10 when omitted or SPECIAL=Y)"
+  echo "  -S, --special[=layout]  Enable special vdev (default: SPECIAL_NVME_COUNT=${SPECIAL_NVME_COUNT} NVMe as ${SPECIAL_MIRROR_WAY}-way mirrors)"
   echo
   echo "  disk_vendor_pattern  Case-insensitive substring matched against:"
   echo "                         - multipath maps (DATA_DISK_SOURCE=mpath, default), or"
@@ -251,90 +378,124 @@ usage() {
   echo "                         for nvme use the large-capacity count, e.g. 20). Must be a multiple of DISKS_PER_VDEV."
   echo
   echo "Key env: DATA_DISK_SOURCE=mpath|nvme  DRAID_PARITY=2|3  DRAID_PROFILE=balanced|capacity  DRAID_MIN_SPARES=0..2"
-  echo "         SPECIAL=Y|layout  SPECIAL_VDEV=layout  SPECIAL_PATTERN=substring  DRY_RUN=1  SKIP_LOG_CACHE=1"
+  echo "         SPECIAL=Y|layout  SPECIAL_NVME_COUNT=N  SPECIAL_MIRROR_WAY=2|3  SPECIAL_PATTERN=substring  DRY_RUN=1"
+  echo "         SLOG=Y|N  CACHE=Y|N  DESTROY_EXISTING=1 (with SKIP_CONFIRM=1: destroy same-name pool non-interactively)"
   echo "         DISKS_PER_VDEV=N  HDD_SPARE_COUNT=N  DRAID_VDEV_SPEC=draidP:Dd:Cc:Ss  ZPOOL_FORCE=1  SKIP_CONFIRM=1"
   echo "By default a create run applies: mpathconf --enable --user_friendly_names n (unless"
   echo "SKIP_MPATH_MPATHCONF=1 or MPATH_USER_FRIENDLY_NAMES=1; skipped for nvme data)."
   echo "Assessment mode never changes host config."
   echo
-  echo "Special vdev: SPECIAL=Y or --special for default mirror10; --help-special for all layouts."
+  echo "Special vdev: SPECIAL=Y or --special for the default layout; --help-special for all layouts."
+  echo "If a pool with the same name exists, create mode shows it and asks (twice) before destroying it."
   exit "${1:-0}"
 }
 
+# --- Special vdev layout model ---
+# Mirror layouts are generic:  mirror<G>          G × 2-way mirror pairs   (e.g. mirror5  = 10 NVMe)
+#                              mirror3x<G>        G × 3-way mirrors        (e.g. mirror3x3 = 9 NVMe)
+#                              …+<S>spare         plus S NVMe as pool hot spares (mirror3x6+2spare = 20 NVMe)
+# Raidz layouts are fixed:     raidz2x10 (2×raidz2 of 10), raidz3x20 (1×raidz3 of 20), raidz2-18+2spare.
+# The default layout is derived from SPECIAL_NVME_COUNT (10) and SPECIAL_MIRROR_WAY (2): 10 NVMe → mirror5;
+# with SPECIAL_MIRROR_WAY=3 → mirror3x3+1spare. Leftover NVMe from an uneven count become pool spares.
+special_layout_from_count() { # $1 nvme count, $2 way (2|3) → canonical layout name
+  local n=$1 way=$2 g sp
+  g=$(( n / way ))
+  sp=$(( n % way ))
+  (( g >= 1 )) || { echo "Error: ${n} NVMe is not enough for one ${way}-way mirror." >&2; return 1; }
+  if (( way == 2 )); then
+    printf 'mirror%d' "$g"
+  else
+    printf 'mirror3x%d' "$g"
+  fi
+  (( sp > 0 )) && printf '+%dspare' "$sp"
+  echo
+}
+
 normalize_special_layout() {
-  case "${1,,}" in
-    default | recommended | mirror10) echo "mirror10" ;;
-    conservative | mirror5) echo "mirror5" ;;
-    staged | mirror8) echo "mirror8" ;;
-    raidz2 | raidz2x10) echo "raidz2x10" ;;
-    raidz3 | raidz3x20) echo "raidz3x20" ;;
-    mirror9 | mirror9x2spare | mirror9+2spare) echo "mirror9+2spare" ;;
-    raidz2-18 | raidz2x18 | raidz2x18+2spare | raidz2-18+2spare) echo "raidz2-18+2spare" ;;
-    mirror3 | mirror3x6 | mirror3x6+2spare) echo "mirror3x6+2spare" ;;
-    *)
-      echo "Error: unknown special vdev layout '${1}' (try --help-special)." >&2
-      return 1
-      ;;
+  local raw="${1,,}"
+  case "$raw" in
+    default | recommended) special_layout_from_count "$SPECIAL_NVME_COUNT" "$SPECIAL_MIRROR_WAY"; return ;;
+    conservative) echo "mirror5"; return ;;
+    staged) echo "mirror8"; return ;;
+    raidz2 | raidz2x10) echo "raidz2x10"; return ;;
+    raidz3 | raidz3x20) echo "raidz3x20"; return ;;
+    raidz2-18 | raidz2x18 | raidz2x18+2spare | raidz2-18+2spare) echo "raidz2-18+2spare"; return ;;
+    mirror9 | mirror9x2spare) echo "mirror9+2spare"; return ;;
+  esac
+  if [[ "$raw" =~ ^mirror(([23])x)?([0-9]+)(\+([0-9]+)spare)?$ ]]; then
+    local way="${BASH_REMATCH[2]:-2}" g="${BASH_REMATCH[3]}" sp="${BASH_REMATCH[5]:-0}"
+    (( g >= 1 )) || { echo "Error: special layout '${1}' needs at least one mirror group." >&2; return 1; }
+    if (( way == 2 )); then printf 'mirror%d' "$g"; else printf 'mirror3x%d' "$g"; fi
+    (( sp > 0 )) && printf '+%dspare' "$sp"
+    echo
+    return 0
+  fi
+  echo "Error: unknown special vdev layout '${1}' (try --help-special)." >&2
+  return 1
+}
+
+# Parse a canonical layout into SL_KIND (mirror|raidz), SL_WAY (mirror width or raidz parity),
+# SL_GROUPS, SL_GROUP_DISKS (disks per group), SL_SPARES.
+special_layout_parse() {
+  local l=$1
+  SL_KIND="" SL_WAY=0 SL_GROUPS=0 SL_GROUP_DISKS=0 SL_SPARES=0
+  if [[ "$l" =~ ^mirror(3x)?([0-9]+)(\+([0-9]+)spare)?$ ]]; then
+    SL_KIND=mirror
+    SL_WAY=2; [[ -n "${BASH_REMATCH[1]}" ]] && SL_WAY=3
+    SL_GROUPS="${BASH_REMATCH[2]}"
+    SL_GROUP_DISKS=$SL_WAY
+    SL_SPARES="${BASH_REMATCH[4]:-0}"
+    return 0
+  fi
+  case "$l" in
+    raidz2x10) SL_KIND=raidz; SL_WAY=2; SL_GROUPS=2; SL_GROUP_DISKS=10; SL_SPARES=0 ;;
+    raidz3x20) SL_KIND=raidz; SL_WAY=3; SL_GROUPS=1; SL_GROUP_DISKS=20; SL_SPARES=0 ;;
+    raidz2-18+2spare) SL_KIND=raidz; SL_WAY=2; SL_GROUPS=1; SL_GROUP_DISKS=18; SL_SPARES=2 ;;
+    *) echo "Error: unknown special vdev layout '${l}'." >&2; return 1 ;;
   esac
 }
 
 special_layout_special_disk_count() {
-  case "$1" in
-    mirror10) echo 20 ;;
-    mirror5) echo 10 ;;
-    mirror8) echo 16 ;;
-    raidz2x10) echo 20 ;;
-    raidz3x20) echo 20 ;;
-    mirror9+2spare) echo 18 ;;
-    raidz2-18+2spare) echo 18 ;;
-    mirror3x6+2spare) echo 18 ;;
-    *)
-      echo "Error: unknown special vdev layout '${1}'." >&2
-      return 1
-      ;;
-  esac
+  special_layout_parse "$1" || return 1
+  echo $(( SL_GROUPS * SL_GROUP_DISKS ))
 }
 
 special_layout_pool_spare_count() {
-  case "$1" in
-    mirror9+2spare | raidz2-18+2spare | mirror3x6+2spare) echo 2 ;;
-    mirror10 | mirror5 | mirror8 | raidz2x10 | raidz3x20) echo 0 ;;
-    *)
-      echo "Error: unknown special vdev layout '${1}'." >&2
-      return 1
-      ;;
-  esac
+  special_layout_parse "$1" || return 1
+  echo "$SL_SPARES"
 }
 
 special_layout_nvme_total() {
-  local special spares
-  special=$(special_layout_special_disk_count "$1") || return 1
-  spares=$(special_layout_pool_spare_count "$1") || return 1
-  echo $((special + spares))
+  special_layout_parse "$1" || return 1
+  echo $(( SL_GROUPS * SL_GROUP_DISKS + SL_SPARES ))
 }
 
-# Disk failures a single special vdev member group survives (mirror pair 1, 3-way 2, raidz2 2, raidz3 3).
+# Disk failures a single special vdev group survives (mirror pair 1, 3-way 2, raidz2 2, raidz3 3).
 special_layout_redundancy() {
-  case "$1" in
-    mirror10 | mirror5 | mirror8 | mirror9+2spare) echo 1 ;;
-    mirror3x6+2spare | raidz2x10 | raidz2-18+2spare) echo 2 ;;
-    raidz3x20) echo 3 ;;
-    *) echo 0 ;;
-  esac
+  special_layout_parse "$1" 2>/dev/null || { echo 0; return; }
+  if [[ "$SL_KIND" == mirror ]]; then echo $(( SL_WAY - 1 )); else echo "$SL_WAY"; fi
+}
+
+# Usable special capacity in disk-equivalents (mirror: one disk per group; raidz: disks − parity).
+special_layout_usable_disks() {
+  special_layout_parse "$1" 2>/dev/null || { echo 0; return; }
+  if [[ "$SL_KIND" == mirror ]]; then echo "$SL_GROUPS"; else echo $(( SL_GROUPS * (SL_GROUP_DISKS - SL_WAY) )); fi
 }
 
 special_layout_summary() {
-  case "$1" in
-    mirror10) echo "10× mirror (20 NVMe) — recommended default" ;;
-    mirror5) echo "5× mirror (10 NVMe) — conservative metadata-only" ;;
-    mirror8) echo "8× mirror (16 NVMe) — staged / expandable" ;;
-    raidz2x10) echo "2× raidz2×10 (20 NVMe) — capacity-biased, not recommended" ;;
-    raidz3x20) echo "1× raidz3×20 (20 NVMe) — parity-matched, not recommended" ;;
-    mirror9+2spare) echo "9× mirror (18 NVMe) + 2 pool hot spares" ;;
-    raidz2-18+2spare) echo "raidz2×18 (18 NVMe) + 2 pool hot spares" ;;
-    mirror3x6+2spare) echo "6× 3-way mirror (18 NVMe) + 2 pool hot spares — recommended for extra redundancy" ;;
-    *) echo "$1" ;;
-  esac
+  special_layout_parse "$1" 2>/dev/null || { echo "$1"; return; }
+  local n=$(( SL_GROUPS * SL_GROUP_DISKS )) txt
+  if [[ "$SL_KIND" == mirror ]]; then
+    if (( SL_WAY == 2 )); then
+      txt="${SL_GROUPS}× mirror pair (${n} NVMe)"
+    else
+      txt="${SL_GROUPS}× 3-way mirror (${n} NVMe) — each survives 2 NVMe failures"
+    fi
+  else
+    txt="${SL_GROUPS}× raidz${SL_WAY} of ${SL_GROUP_DISKS} (${n} NVMe) — not recommended for special"
+  fi
+  (( SL_SPARES > 0 )) && txt+=" + ${SL_SPARES} pool hot spare(s)"
+  echo "$txt"
 }
 
 resolve_special_config() {
@@ -345,7 +506,7 @@ resolve_special_config() {
     "" | n | no | 0 | false) return 0 ;;
     y | yes | 1 | true)
       SPECIAL_ENABLED=1
-      SPECIAL_LAYOUT=$(normalize_special_layout mirror10) || exit 1
+      SPECIAL_LAYOUT=$(normalize_special_layout default) || exit 1
       ;;
     *)
       SPECIAL_ENABLED=1
@@ -425,6 +586,17 @@ else
   set --
 fi
 
+for _v in SLOG CACHE; do
+  case "${!_v^^}" in Y | N) ;; *) echo "Error: ${_v} must be Y or N (got '${!_v}')." >&2; exit 1 ;; esac
+done
+if ! [[ "$SPECIAL_NVME_COUNT" =~ ^[0-9]+$ ]] || (( SPECIAL_NVME_COUNT < 2 )); then
+  echo "Error: SPECIAL_NVME_COUNT must be an integer >= 2 (got '${SPECIAL_NVME_COUNT}')." >&2
+  exit 1
+fi
+if [[ "$SPECIAL_MIRROR_WAY" != 2 && "$SPECIAL_MIRROR_WAY" != 3 ]]; then
+  echo "Error: SPECIAL_MIRROR_WAY must be 2 or 3 (got '${SPECIAL_MIRROR_WAY}')." >&2
+  exit 1
+fi
 for _v in ZFS_ARC_MAX_PCT ZFS_ARC_MIN_PCT; do
   if ! [[ "${!_v}" =~ ^[0-9]+$ ]] || (( ${!_v} < 1 || ${!_v} > 95 )); then
     echo "Error: ${_v} must be an integer percent 1..95 (got '${!_v}')." >&2
@@ -730,10 +902,14 @@ nvme_by_id_candidates() {
 }
 
 is_nvme_unused_for_zfs() {
-  local dev=$1 btype
+  local dev=$1 btype reason
   btype=$(lsblk -dn -o TYPE "$dev" 2>/dev/null || true)
   [[ "${btype:-}" == disk ]] || return 1
-  device_in_use_reason "$dev" >/dev/null
+  if reason=$(device_in_use_reason "$dev"); then
+    return 0
+  fi
+  # Dry run against an existing same-name pool: its members will be freed by the destroy step.
+  [[ "$reason" == zfs_member && -n "${DESTROY_MEMBERS[$(readlink -f "$dev")]:-}" ]]
 }
 
 # Rank of an NVMe by-id link: 0 = nvme-<Model>_<SN> (the ORCD naming convention, e.g.
@@ -828,7 +1004,7 @@ discover_nvme_aux_vdevs() {
 
   if (( nvme_total == 0 )); then
     if (( AUX_NVME_COUNT == 0 )); then
-      echo "Note: SKIP_LOG_CACHE=1 and no special vdev requested — pool will have no NVMe vdevs." >&2
+      echo "Note: SLOG=N CACHE=N and no special vdev requested — pool will have no NVMe vdevs." >&2
       return 0
     fi
     if (( n < AUX_NVME_COUNT )); then
@@ -853,17 +1029,23 @@ discover_nvme_aux_vdevs() {
     exit 1
   fi
 
-  if (( AUX_NVME_COUNT == 4 )); then
-    read -r s0 p0 <<<"${sorted_asc[0]}"
-    read -r s1 p1 <<<"${sorted_asc[1]}"
-    read -r s2 p2 <<<"${sorted_asc[2]}"
-    read -r s3 p3 <<<"${sorted_asc[3]}"
+  # Smallest NVMe first: SLOG mirror (2) when SLOG=Y, then L2ARC (2) when CACHE=Y.
+  i=0
+  if [[ "${SLOG^^}" == Y ]]; then
+    read -r s0 p0 <<<"${sorted_asc[i]}"
+    read -r s1 p1 <<<"${sorted_asc[i + 1]}"
     NVME_LOG=("$p0" "$p1")
-    NVME_CACHE=("$p2" "$p3")
     if [[ "$s0" != "$s1" ]]; then
       echo "Warning: SLOG mirror members differ in size ($s0 vs $s1 bytes); the mirror is limited to the smaller one." >&2
     fi
+    i=$((i + 2))
+  fi
+  if [[ "${CACHE^^}" == Y ]]; then
+    read -r s2 p2 <<<"${sorted_asc[i]}"
+    read -r s3 p3 <<<"${sorted_asc[i + 1]}"
+    NVME_CACHE=("$p2" "$p3")
     : "$s2" "$s3"
+    i=$((i + 2))
   fi
 
   if (( nvme_total == 0 )); then
@@ -924,41 +1106,24 @@ discover_nvme_aux_vdevs() {
 append_special_vdev_to_zpool_cmd() {
   local layout=$1
   local -a disks=("${@:2}")
-  local need i
+  local need i g
 
-  need=$(special_layout_special_disk_count "$layout") || return 1
+  special_layout_parse "$layout" || return 1
+  need=$(( SL_GROUPS * SL_GROUP_DISKS ))
   if ((${#disks[@]} != need)); then
     echo "Error: special layout ${layout} needs ${need} special disk(s), got ${#disks[@]}." >&2
     return 1
   fi
 
   _zpool_cmd+=(special)
-  case "$layout" in
-    mirror10 | mirror5 | mirror8 | mirror9+2spare)
-      for ((i = 0; i < need; i += 2)); do
-        _zpool_cmd+=(mirror "${disks[i]}" "${disks[i + 1]}")
-      done
-      ;;
-    raidz2x10)
-      _zpool_cmd+=(raidz2 "${disks[@]:0:10}")
-      _zpool_cmd+=(raidz2 "${disks[@]:10:10}")
-      ;;
-    raidz3x20)
-      _zpool_cmd+=(raidz3 "${disks[@]}")
-      ;;
-    raidz2-18+2spare)
-      _zpool_cmd+=(raidz2 "${disks[@]}")
-      ;;
-    mirror3x6+2spare)
-      for ((i = 0; i < need; i += 3)); do
-        _zpool_cmd+=(mirror "${disks[i]}" "${disks[i + 1]}" "${disks[i + 2]}")
-      done
-      ;;
-    *)
-      echo "Error: unsupported special layout '${layout}'." >&2
-      return 1
-      ;;
-  esac
+  for ((g = 0; g < SL_GROUPS; g++)); do
+    i=$(( g * SL_GROUP_DISKS ))
+    if [[ "$SL_KIND" == mirror ]]; then
+      _zpool_cmd+=(mirror "${disks[@]:i:SL_GROUP_DISKS}")
+    else
+      _zpool_cmd+=("raidz${SL_WAY}" "${disks[@]:i:SL_GROUP_DISKS}")
+    fi
+  done
 }
 
 # OpenZFS dRAID: (children - spares) must be a multiple of (data + parity); see dRAID Howto.
@@ -1046,23 +1211,28 @@ discover_nvme_data_and_four_aux() {
   fi
 
   declare -a tail=("${sorted_desc[@]:TOTAL_DISKS}")
-  mapfile -t tail_sorted < <(printf '%s\n' "${tail[@]}" | sort -k1,1n | head -n 4)
-  if ((${#tail_sorted[@]} != 4)); then
-    echo "Error: internal NVMe tail selection failed (expected 4 auxiliary disks)." >&2
+  mapfile -t tail_sorted < <(printf '%s\n' "${tail[@]}" | sort -k1,1n | head -n "$AUX_NVME_COUNT")
+  if ((${#tail_sorted[@]} != AUX_NVME_COUNT)); then
+    echo "Error: internal NVMe tail selection failed (expected ${AUX_NVME_COUNT} auxiliary disks)." >&2
     exit 1
   fi
 
   local s0 s1 s2 s3 p0 p1 p2 p3
-  read -r s0 p0 <<<"${tail_sorted[0]}"
-  read -r s1 p1 <<<"${tail_sorted[1]}"
-  read -r s2 p2 <<<"${tail_sorted[2]}"
-  read -r s3 p3 <<<"${tail_sorted[3]}"
-  : "$s2" "$s3"
-  # Smallest two → SLOG; next two → L2ARC (same-size disks split 2+2).
-  NVME_LOG=("$p0" "$p1")
-  NVME_CACHE=("$p2" "$p3")
-  if [[ "$s0" != "$s1" ]]; then
-    echo "Warning: SLOG mirror members differ in size ($s0 vs $s1 bytes); the mirror is limited to the smaller one." >&2
+  i=0
+  if [[ "${SLOG^^}" == Y ]]; then
+    read -r s0 p0 <<<"${tail_sorted[i]}"
+    read -r s1 p1 <<<"${tail_sorted[i + 1]}"
+    NVME_LOG=("$p0" "$p1")
+    if [[ "$s0" != "$s1" ]]; then
+      echo "Warning: SLOG mirror members differ in size ($s0 vs $s1 bytes); the mirror is limited to the smaller one." >&2
+    fi
+    i=$((i + 2))
+  fi
+  if [[ "${CACHE^^}" == Y ]]; then
+    read -r s2 p2 <<<"${tail_sorted[i]}"
+    read -r s3 p3 <<<"${tail_sorted[i + 1]}"
+    NVME_CACHE=("$p2" "$p3")
+    : "$s2" "$s3"
   fi
 }
 
@@ -1116,7 +1286,10 @@ print_visual_pool_layout() {
     echo
   fi
   if ((${#NVME_LOG[@]} == 0 && ${#NVME_CACHE[@]} == 0)); then
-    echo "--- log / cache: none (SKIP_LOG_CACHE=1) ---"
+    echo "--- log / cache: none (SLOG=N CACHE=N) ---"
+    echo
+  elif ((${#NVME_CACHE[@]} == 0)); then
+    echo "--- cache (L2ARC): none (CACHE=N) ---"
     echo
   fi
   if (( SPECIAL_ENABLED )); then
@@ -1405,15 +1578,8 @@ assess_draid_usable_bytes() {
 
 assess_special_usable_bytes() {
   local layout=$1 disk_b=$2 n
-  n=$(special_layout_special_disk_count "$layout") || { echo 0; return; }
-  case "$layout" in
-    mirror10 | mirror5 | mirror8 | mirror9+2spare) echo $(( (n / 2) * disk_b )) ;;
-    raidz2x10) echo $((16 * disk_b)) ;;
-    raidz3x20) echo $((17 * disk_b)) ;;
-    raidz2-18+2spare) echo $((16 * disk_b)) ;;
-    mirror3x6+2spare) echo $((6 * disk_b)) ;;
-    *) echo 0 ;;
-  esac
+  n=$(special_layout_usable_disks "$layout")
+  echo $(( n * disk_b ))
 }
 
 # Pick the dRAID vdev width for N unused disks. Candidates 8..DRAID_MAX_WIDTH (default 40): the width whose
@@ -1465,32 +1631,50 @@ assess_zpool_has_section() {
   zpool status "$pool" 2>/dev/null | awk -v s="$section" '$1 == s { found = 1 } END { exit found ? 0 : 1 }'
 }
 
+# Candidate special layouts for N eligible NVMe: default count (SPECIAL_NVME_COUNT) in 2-way and 3-way,
+# then "all eligible NVMe" in 2-way and 3-way, then the fixed raidz layouts. Only layouts that fit are listed.
+assess_candidate_layouts() {
+  local fit=$1 n way l
+  local -a out=()
+  for n in "$SPECIAL_NVME_COUNT" "$fit"; do
+    (( n >= 2 && n <= fit )) || continue
+    for way in 2 3; do
+      l=$(special_layout_from_count "$n" "$way" 2>/dev/null) || continue
+      [[ " ${out[*]} " == *" $l "* ]] || out+=("$l")
+    done
+  done
+  for l in raidz2-18+2spare raidz2x10 raidz3x20; do
+    (( $(special_layout_nvme_total "$l") <= fit )) || continue
+    out+=("$l")
+  done
+  printf '%s\n' ${out[@]+"${out[@]}"}
+}
+
 assess_print_special_feasibility() {
   local unused=$1 special_fit=$2 small_n=$3 large_n=$4 large_sz=$5
   local need layout nvme_n
   echo "--- Special vdev feasibility (priority) ---"
   echo "  Losing an entire special vdev loses the pool — prefer mirrored special in production."
   echo "  Sizing: ~0.2–2% of data capacity for metadata; up to ~5% if using special_small_blocks."
+  echo "  Default special size: SPECIAL_NVME_COUNT=${SPECIAL_NVME_COUNT} NVMe (SPECIAL_MIRROR_WAY=${SPECIAL_MIRROR_WAY}); pass"
+  echo "  --special=<layout> or SPECIAL_NVME_COUNT=N to use more/fewer. Unused NVMe stay free for later zpool add."
   echo
   if (( unused < 4 )); then
-    echo "  Log + L2ARC: NO  (need 4 unused NVMe, found ${unused})"
+    echo "  SLOG + L2ARC: NO  (need 4 unused NVMe for both, found ${unused}; CACHE=N needs only 2)"
   else
-    echo "  Log + L2ARC: YES (4 smallest unused NVMe)"
+    echo "  SLOG + L2ARC: YES (4 smallest unused NVMe: 2 SLOG mirror + 2 L2ARC; CACHE=N keeps the 2 L2ARC NVMe free)"
   fi
-  if (( special_fit == 0 )); then
-    echo "  Special vdev: NO named layout fits after reserving 4 NVMe for log+cache."
-    echo "    Minimum script layout is mirror5 (10 NVMe special + 4 log/cache = 14 NVMe)."
-    echo "    Add 10–20 same-size NVMe (typically 7.68T class) for a special vdev."
+  if (( special_fit < 2 )); then
+    echo "  Special vdev: NO layout fits after reserving 4 NVMe for log+cache (need >= 2 more)."
   else
-    echo "  Special layouts that fit (largest unused NVMe tier, after 4 for log+cache):"
-    for layout in mirror10 mirror3x6+2spare mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20; do
+    echo "  Special layouts that fit (largest unused NVMe tier, after 4 for log+cache; ${special_fit} eligible):"
+    while IFS= read -r layout; do
+      [[ -n "$layout" ]] || continue
       nvme_n=$(special_layout_nvme_total "$layout") || continue
-      if (( nvme_n <= special_fit )); then
-        need=$((4 + nvme_n))
-        printf '    %-18s %2d NVMe special/spare  (need %2d unused NVMe total)  %s\n' \
-          "$layout" "$nvme_n" "$need" "$(special_layout_summary "$layout")"
-      fi
-    done
+      need=$((4 + nvme_n))
+      printf '    %-18s %2d NVMe special/spare  (need %2d unused NVMe total)  %s\n' \
+        "$layout" "$nvme_n" "$need" "$(special_layout_summary "$layout")"
+    done < <(assess_candidate_layouts "$special_fit")
   fi
   if (( small_n > 0 && small_n < 4 && large_n >= 10 )); then
     echo
@@ -1501,7 +1685,7 @@ assess_print_special_feasibility() {
 }
 
 assess_print_create_option() {
-  local tag=$1 parity=$2 width=$3 ndisks=$4 vendor=$5 layout=$6 disk_b=$7 spec=$8 nvme_sz=$9 hdd_spares=${10:-0}
+  local tag=$1 parity=$2 width=$3 ndisks=$4 vendor=$5 layout=$6 disk_b=$7 spec=$8 nvme_sz=$9 hdd_spares=${10:-0} cache=${11:-Y}
   local nvdev usable spec_u ratio cmd extra
   nvdev=$((ndisks / width))
   usable=$(assess_draid_usable_bytes "$spec" "$disk_b" "$nvdev")
@@ -1511,7 +1695,11 @@ assess_print_create_option() {
   if (( hdd_spares > 0 )); then
     echo "    HDD spare: ${hdd_spares}× leftover ${vendor} → pool hot spare(s)"
   fi
-  extra="    Aux:      2× NVMe SLOG mirror + 2× NVMe L2ARC"
+  if [[ "$cache" == Y ]]; then
+    extra="    Aux:      2× NVMe SLOG mirror + 2× NVMe L2ARC"
+  else
+    extra="    Aux:      2× NVMe SLOG mirror, no L2ARC (CACHE=N — 2 small NVMe stay free)"
+  fi
   if [[ -n "$layout" ]]; then
     spec_u=$(assess_special_usable_bytes "$layout" "$nvme_sz")
     extra+=$'\n'"    Special:  ${layout} — $(special_layout_summary "$layout")  ($(human_bytes "$spec_u") usable)"
@@ -1531,6 +1719,7 @@ assess_print_create_option() {
   [[ "$parity" != 3 ]] && env+=" DRAID_PARITY=${parity}"
   [[ "$width" != 26 ]] && env+=" DISKS_PER_VDEV=${width}"
   (( hdd_spares > 0 )) && env+=" HDD_SPARE_COUNT=${hdd_spares}"
+  [[ "$cache" == N ]] && env+=" CACHE=N"
   echo "    Create:   ${env} ${cmd}"
   echo "    Dry-run:  ${env} DRY_RUN=1 ${cmd}"
   echo
@@ -1547,7 +1736,6 @@ run_storage_assessment() {
   {
     host=$(hostname)
     ASSESS_SELF="./$(basename "$SCRIPT_PATH")"
-    layout_order=(mirror10 mirror3x6+2spare mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20)
     ASSESS_RANK=0
     mpath_rows=()
     nvme_rows=()
@@ -1762,49 +1950,63 @@ run_storage_assessment() {
         alt_ndisks=$((navail - navail % 26))
       fi
 
-      best_layout=""
-      for layout in "${layout_order[@]}"; do
-        nvme_n=$(special_layout_nvme_total "$layout") || continue
-        if (( nvme_n <= special_fit )); then
-          best_layout=$layout
-          break
-        fi
-      done
+      # Candidate special layouts that fit; the default-count layouts (2-way, then 3-way) are RECOMMENDED,
+      # each shown with L2ARC and without (CACHE=N). Larger/raidz layouts follow as alternatives.
+      mapfile -t cand_layouts < <(assess_candidate_layouts "$special_fit")
+      best_layout="${cand_layouts[0]:-}"
+      def2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
+      def3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
 
-      # dRAID3 + each fitting special layout (recommended first)
       spec=$(compute_best_draid_spec "$width" 3 balanced 2>/dev/null || true)
       if [[ -n "$spec" && -n "$best_layout" ]]; then
-        assess_print_create_option \
-          "RECOMMENDED (max special capacity) — dRAID3 + special ${best_layout}" \
-          3 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
+        for layout in "${cand_layouts[@]}"; do
+          nvme_n=$(special_layout_nvme_total "$layout") || continue
+          if [[ "$layout" == "$def2" ]]; then
+            assess_print_create_option \
+              "RECOMMENDED — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 2-way mirrors) + L2ARC" \
+              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+            assess_print_create_option \
+              "RECOMMENDED — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 2-way mirrors), no L2ARC" \
+              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+          elif [[ "$layout" == "$def3" ]]; then
+            assess_print_create_option \
+              "RECOMMENDED (extra redundancy) — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 3-way mirrors) + L2ARC" \
+              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+            assess_print_create_option \
+              "RECOMMENDED (extra redundancy) — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 3-way mirrors), no L2ARC" \
+              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+          else
+            case "$layout" in
+              raidz*)
+                assess_print_create_option \
+                  "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                ;;
+              mirror3x*)
+                assess_print_create_option \
+                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors) — dRAID3 + special ${layout}" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                assess_print_create_option \
+                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                ;;
+              *)
+                assess_print_create_option \
+                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors) — dRAID3 + special ${layout}" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                assess_print_create_option \
+                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                ;;
+            esac
+          fi
+        done
         if (( alt_width > 0 )); then
           alt_spec=$(compute_best_draid_spec "$alt_width" 3 balanced 2>/dev/null || true)
           [[ -n "$alt_spec" ]] && assess_print_create_option \
             "ALTERNATIVE — dRAID3 + special ${best_layout}, proven 26-wide vdevs" \
-            3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))"
+            3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))" Y
         fi
-        for layout in "${layout_order[@]}"; do
-          [[ "$layout" == "$best_layout" ]] && continue
-          nvme_n=$(special_layout_nvme_total "$layout") || continue
-          (( nvme_n <= special_fit )) || continue
-          case "$layout" in
-            mirror3x6+2spare)
-              assess_print_create_option \
-                "RECOMMENDED (extra redundancy) — dRAID3 + special ${layout}: each 3-way mirror survives 2 NVMe failures" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
-              ;;
-            raidz2x10 | raidz3x20 | raidz2-18+2spare)
-              assess_print_create_option \
-                "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
-              ;;
-            *)
-              assess_print_create_option \
-                "ALTERNATIVE — dRAID3 + special ${layout}" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
-              ;;
-          esac
-        done
       elif [[ -n "$spec" ]]; then
         echo "No special vdev layout fits this host. dRAID3 without special is listed last."
         echo
@@ -1872,7 +2074,7 @@ run_storage_assessment() {
 
     echo "--- Existing pool enhancement (no recreate; special vdev add) ---"
     enhanced=0
-    if ((${#pools[@]} > 0)) && [[ -n "${pools[0]:-}" ]] && (( unused_nvme_n >= 10 )); then
+    if ((${#pools[@]} > 0)) && [[ -n "${pools[0]:-}" ]] && (( unused_nvme_n >= 2 )); then
       nv_sorted=()
       spec_paths=()
       mapfile -t nv_sorted < <(printf '%s\n' "${unused_nvme[@]+"${unused_nvme[@]}"}" | sort -k1,1nr)
@@ -1884,14 +2086,15 @@ run_storage_assessment() {
         fi
         add_layout=""
         add_n=0
-        for layout in "${layout_order[@]}"; do
+        while IFS= read -r layout; do
+          [[ -n "$layout" ]] || continue
           add_n=$(special_layout_special_disk_count "$layout") || continue
           spare_n=$(special_layout_pool_spare_count "$layout") || continue
           if (( add_n + spare_n <= unused_nvme_n )); then
             add_layout=$layout
             break
           fi
-        done
+        done < <(assess_candidate_layouts "$unused_nvme_n")
         if [[ -z "$add_layout" ]]; then
           continue
         fi
@@ -1922,7 +2125,7 @@ run_storage_assessment() {
     fi
     if (( enhanced == 0 )); then
       echo "  No existing pool is missing a special vdev with enough unused NVMe to add one."
-      echo "  (Requires an imported pool without special, plus ≥10 unused NVMe for mirror5.)"
+      echo "  (Requires an imported pool without special, plus ≥2 unused NVMe.)"
       echo
     fi
 
@@ -2001,6 +2204,9 @@ fi
 _in_use_list=()
 for _p in "${ALL_HDD_PATHS[@]}" ${HDD_SPARES[@]+"${HDD_SPARES[@]}"}; do
   if ! _reason=$(device_in_use_reason "$_p"); then
+    if [[ "${_reason:-}" == zfs_member && -n "${DESTROY_MEMBERS[$(readlink -f "$_p")]:-}" ]]; then
+      continue   # member of the pool that a real run destroys first (dry run only)
+    fi
     _in_use_list+=("${_p}  [${_reason:-in-use}]")
   fi
 done
@@ -2158,6 +2364,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
   {
     echo
     echo "DRY_RUN=1 — zpool create was NOT executed."
+    if [[ -n "$DESTROY_PENDING_POOL" ]]; then
+      echo "DRY_RUN=1 — existing pool '${DESTROY_PENDING_POOL}' was NOT destroyed; a real run asks first (twice)."
+    fi
   } | tee -a "$POOL_SETUP_LOG"
   echo "DRY_RUN=1 — not creating pool."
   exit 0
