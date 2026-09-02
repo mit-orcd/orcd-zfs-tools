@@ -43,7 +43,7 @@
 #   ZFS_ATIME        atime value for the pool root dataset (default: off)
 #   ZFS_ARC_TUNE     1 (default) writes /etc/modprobe.d/zfs.conf with zfs_arc_max/zfs_arc_min/zfs_dirty_data_max
 #                    after a successful create and applies them live via /sys; 0 skips. Sizing from MemTotal:
-#   ZFS_ARC_MAX_PCT  ARC max as % of RAM (default 75 — dedicated storage node)
+#   ZFS_ARC_MAX_PCT  ARC max as % of RAM (default 60; OpenZFS default is 50)
 #   ZFS_ARC_MIN_PCT  ARC min as % of RAM (default 25)
 #   ZFS_DIRTY_DATA_MAX  bytes (default 8 GiB when RAM >= 128 GiB, else ZFS default)
 #   ORCD_BACKUP_DEST rsync destination for script + pool key after create
@@ -86,7 +86,7 @@ SKIP_LOG_CACHE="${SKIP_LOG_CACHE:-0}"
 ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
 HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
 ZFS_ARC_TUNE="${ZFS_ARC_TUNE:-1}"
-ZFS_ARC_MAX_PCT="${ZFS_ARC_MAX_PCT:-75}"
+ZFS_ARC_MAX_PCT="${ZFS_ARC_MAX_PCT:-60}"
 ZFS_ARC_MIN_PCT="${ZFS_ARC_MIN_PCT:-25}"
 ZFS_DIRTY_DATA_MAX="${ZFS_DIRTY_DATA_MAX:-}"
 HDD_SPARES=()
@@ -1226,7 +1226,7 @@ discover_four_nvme_log_and_cache() {
   discover_nvme_aux_vdevs
 }
 
-# --- ARC sizing (dedicated storage node): arc_max 75% / arc_min 25% of MemTotal, 8 GiB dirty data ---
+# --- ARC sizing (dedicated storage node): arc_max 60% / arc_min 25% of MemTotal, 8 GiB dirty data ---
 ARC_MEM_B=0 ARC_MAX_B=0 ARC_MIN_B=0 ARC_DIRTY_B=0
 compute_arc_sizing() {
   local kb
