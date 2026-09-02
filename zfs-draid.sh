@@ -19,6 +19,7 @@
 #   DRAID_VDEV_SPEC=draid3:9d:26c:2s zfs-draid.sh SEAGATE 78   # restore fixed 26-disk dRAID3 tuple from older script
 #   SPECIAL=Y DRY_RUN=1 zfs-draid.sh SEAGATE 78                # + default special vdev (10× mirror, 20 NVMe)
 #   zfs-draid.sh --special=mirror5 SEAGATE 78                  # conservative special vdev (5× mirror, 10 NVMe)
+#   zfs-draid.sh --special=mirror3x6+2spare SEAGATE 78         # 6× 3-way mirror special (extra redundancy) + 2 spares
 #   zfs-draid.sh --special=mirror9+2spare SEAGATE 78           # 9× mirror special + 2 pool hot spares
 #   zfs-draid.sh --special=raidz2-18+2spare SEAGATE 78         # raidz2×18 special + 2 pool hot spares
 #   DATA_DISK_SOURCE=nvme DRAID_PARITY=2 DRY_RUN=1 zfs-draid.sh MICRON 20
@@ -183,8 +184,11 @@ Special vdev layouts (enable with SPECIAL=Y, --special[=layout], or SPECIAL_VDEV
 
   Layout       NVMe disks   zpool fragment (conceptual)     Notes
   ---------    ----------   -----------------------------     -----
-  mirror10     20           special + 10× mirror pairs       DEFAULT / recommended (metadata + moderate
-               (default)                                      special_small_blocks). ~5% of a ~1.4 PB pool.
+  mirror10     20           special + 10× mirror pairs       DEFAULT / recommended (max special capacity:
+               (default)                                      metadata + moderate special_small_blocks).
+
+  mirror3x6+2spare 20       special + 6× 3-way mirror        RECOMMENDED for extra redundancy: each mirror
+                               + spare ×2 (18+2)              survives 2 NVMe failures; 6× capacity; 2 hot spares.
 
   mirror5      10           special + 5× mirror pairs        Conservative metadata-only; leaves 10 NVMe free
                                                                 for later "zpool add special mirror …".
@@ -201,10 +205,6 @@ Special vdev layouts (enable with SPECIAL=Y, --special[=layout], or SPECIAL_VDEV
 
   raidz2-18+2spare 20       special raidz2×18 + spare ×2     18 NVMe raidz2 (~16× capacity); 2 pool hot spares.
                                (18+2)                         More special TB; tolerates 2 failures in special vdev.
-
-  mirror3x6+2spare 20       special + 6× 3-way mirror        18 NVMe in 6 triple mirrors (6× capacity); 2 pool hot
-                               + spare ×2 (18+2)              spares. Each mirror survives 2 failures; still needs -f
-                                                              next to dRAID3 (3 vs 2), no -f next to dRAID2.
 
 Replication-level note: OpenZFS refuses "draidN + lower-redundancy special" without -f (mismatched
   replication level). The script adds -f automatically for that case — expected, not an error. The
@@ -323,7 +323,7 @@ special_layout_summary() {
     raidz3x20) echo "1× raidz3×20 (20 NVMe) — parity-matched, not recommended" ;;
     mirror9+2spare) echo "9× mirror (18 NVMe) + 2 pool hot spares" ;;
     raidz2-18+2spare) echo "raidz2×18 (18 NVMe) + 2 pool hot spares" ;;
-    mirror3x6+2spare) echo "6× 3-way mirror (18 NVMe) + 2 pool hot spares" ;;
+    mirror3x6+2spare) echo "6× 3-way mirror (18 NVMe) + 2 pool hot spares — recommended for extra redundancy" ;;
     *) echo "$1" ;;
   esac
 }
@@ -1375,7 +1375,7 @@ assess_print_special_feasibility() {
     echo "    Add 10–20 same-size NVMe (typically 7.68T class) for a special vdev."
   else
     echo "  Special layouts that fit (largest unused NVMe tier, after 4 for log+cache):"
-    for layout in mirror10 mirror9+2spare mirror8 mirror5 mirror3x6+2spare raidz2-18+2spare raidz2x10 raidz3x20; do
+    for layout in mirror10 mirror3x6+2spare mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20; do
       nvme_n=$(special_layout_nvme_total "$layout") || continue
       if (( nvme_n <= special_fit )); then
         need=$((4 + nvme_n))
@@ -1439,7 +1439,7 @@ run_storage_assessment() {
   {
     host=$(hostname)
     ASSESS_SELF="./$(basename "$SCRIPT_PATH")"
-    layout_order=(mirror10 mirror9+2spare mirror8 mirror5 mirror3x6+2spare raidz2-18+2spare raidz2x10 raidz3x20)
+    layout_order=(mirror10 mirror3x6+2spare mirror9+2spare mirror8 mirror5 raidz2-18+2spare raidz2x10 raidz3x20)
     ASSESS_RANK=0
     mpath_rows=()
     nvme_rows=()
@@ -1667,7 +1667,7 @@ run_storage_assessment() {
       spec=$(compute_best_draid_spec "$width" 3 balanced 2>/dev/null || true)
       if [[ -n "$spec" && -n "$best_layout" ]]; then
         assess_print_create_option \
-          "RECOMMENDED — dRAID3 + special ${best_layout}" \
+          "RECOMMENDED (max special capacity) — dRAID3 + special ${best_layout}" \
           3 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
         if (( alt_width > 0 )); then
           alt_spec=$(compute_best_draid_spec "$alt_width" 3 balanced 2>/dev/null || true)
@@ -1680,6 +1680,11 @@ run_storage_assessment() {
           nvme_n=$(special_layout_nvme_total "$layout") || continue
           (( nvme_n <= special_fit )) || continue
           case "$layout" in
+            mirror3x6+2spare)
+              assess_print_create_option \
+                "RECOMMENDED (extra redundancy) — dRAID3 + special ${layout}: each 3-way mirror survives 2 NVMe failures" \
+                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
+              ;;
             raidz2x10 | raidz3x20 | raidz2-18+2spare)
               assess_print_create_option \
                 "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \

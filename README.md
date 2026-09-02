@@ -232,6 +232,10 @@ The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing
     Usable:   ~982 TiB data
     Create:   POOL=data1 ./zfs-draid.sh --special=mirror10 SEAGATE 78
     Dry-run:  POOL=data1 DRY_RUN=1 ./zfs-draid.sh --special=mirror10 SEAGATE 78
+
+[2] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x6+2spare
+    Special:  6× 3-way mirror (18 NVMe) + 2 pool hot spares  (41.92 TiB usable)
+    Create:   POOL=data1 ./zfs-draid.sh --special=mirror3x6+2spare SEAGATE 78
 ```
 
 A disk counts as *unused* only if it has no filesystem, no partition table, no ZFS label, no mount and no LVM/md/LUKS holder — so the OS NVMe is never offered as SLOG/special.
@@ -277,7 +281,7 @@ The assessment report shows the current naming mode (`Map naming: WWID` or `mpat
 |------|---------|
 | Data | `total_hdd_count / DISKS_PER_VDEV` dRAID vdevs (default 26 wide). Layout auto-computed per vdev: parity `DRAID_PARITY` (3), profile `balanced` (≥2 redundancy groups, D≈8) and **at least 1 distributed spare** (`DRAID_MIN_SPARES`). 78 disks → `3 × draid3:9d:26c:2s`. Fix a literal with `DRAID_VDEV_SPEC=draid3:9d:26c:2s`. |
 | Log / cache | 4 smallest unused NVMe: 2× SLOG mirror + 2× L2ARC. `SKIP_LOG_CACHE=1` to omit. |
-| Special | Largest unused NVMe after log/cache; layouts via `--special=<layout>` (`--help-special`): `mirror10` (default, 20 NVMe), `mirror9+2spare`, `mirror8`, `mirror5`, `mirror3x6+2spare` (6× 3-way mirrors), and raidz variants (not recommended). `SPECIAL_PATTERN=7600` restricts to one model. |
+| Special | Largest unused NVMe after log/cache; layouts via `--special=<layout>` (`--help-special`). Two recommended choices: `mirror10` (default; 10 mirror pairs, max special capacity) and `mirror3x6+2spare` (6× **3-way mirrors** + 2 hot spares — each mirror survives 2 NVMe failures; preferred when extra redundancy matters more than capacity). Others: `mirror9+2spare`, `mirror8`, `mirror5`, and raidz variants (not recommended). `SPECIAL_PATTERN=7600` restricts to one model. |
 | Pool props | `ashift=12 autoexpand=on autoreplace=on autotrim=on`, `acltype=posixacl xattr=sa dnodesize=auto atime=off compression=lz4 dedup=off` (`ZFS_ATIME=on` to change). |
 
 **About `zpool create -f`:** OpenZFS refuses a pool whose top-level vdevs differ in redundancy — *mismatched replication level: draid and mirror vdevs with different redundancy, 3 vs. 1* — unless `-f` is given. dRAID3 data plus a 2-way-mirrored NVMe special vdev is exactly that (and the intended design), so the script adds `-f` automatically whenever the special layout's redundancy is below the dRAID parity and prints a note saying so. This does not weaken safety: the script's own in-use check on every selected device runs before `zpool create`. Log devices are exempt from the check; `raidz3x20` or `DRAID_PARITY=2` with `mirror3x6+2spare` need no `-f`.
