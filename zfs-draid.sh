@@ -24,39 +24,70 @@
 #   DATA_DISK_SOURCE=nvme DRAID_PARITY=2 DRY_RUN=1 zfs-draid.sh MICRON 20
 #
 # Environment overrides:
-#   POOL             Pool name (default: hostname-based data1/data2 when script is named zfs-draid*;
-#                    otherwise script basename before first dot)
+#   POOL             Pool name. Default: hostname ending n1-mgmt → data1, n2-mgmt → data2, anything else → data1
+#                    (a script not named zfs-draid* uses its basename). Create/dry-run always asks you to verify
+#                    the name (Enter keeps it, or type another); SKIP_CONFIRM=1 / non-tty accept the default.
 #   DATA_DISK_SOURCE  mpath | nvme (default: mpath)
 #   DRAID_PARITY     2 or 3 (default: 3). dRAID layout (D,S) is computed per vdev child count.
 #   DRAID_PROFILE    balanced (default) | capacity — balanced prefers ≥2 redundancy groups and D≈8;
 #                    capacity maximizes data disks (may use a single very wide group).
 #   DRAID_VDEV_SPEC  If set (e.g. draid3:9d:26c:2s), use this literal for every dRAID child vdev instead of auto layout.
+#   DRAID_MIN_SPARES Minimum distributed spares per dRAID vdev for the auto layout (default: 1; 0 = pure capacity).
+#                    Distributed spares are what give dRAID its fast sequential rebuild — keep >= 1 in production.
 #   DISKS_PER_VDEV   Disks per dRAID child vdev (mpath default: 26; nvme default: total_hdd_count)
+#   HDD_SPARE_COUNT  Extra matched HDDs (after the data disks) added as pool hot spares (default 0)
+#   DRAID_MAX_WIDTH  Assessment: widest vdev it will propose (default 40)
+#   SKIP_LOG_CACHE=1 Do not reserve 4 NVMe for SLOG mirror + L2ARC (all unused NVMe become eligible for special).
+#   ZPOOL_FORCE=1    Pass -f to zpool create (only after reviewing the in-use pre-check output).
+#   ZFS_ATIME        atime value for the pool root dataset (default: off)
+#   ORCD_BACKUP_DEST rsync destination for script + pool key after create
+#                    (default: hstor001:/data2/backup/systems/001/<hostname>/; empty string disables)
 #   SPECIAL          Y | layout name — enable special vdev (default layout: mirror10). N/no/0 disables.
 #   SPECIAL_VDEV     Same as SPECIAL when set to a layout name; overrides SPECIAL=Y default.
 #   SPECIAL_PATTERN  Optional substring filter for NVMe chosen as special (default: largest unused after log/cache).
 #   DRY_RUN=1        Print discovery, layout, command, and log preamble only (no mpathconf / zpool create)
-#   MPATH_SORT_CMD   Optional sort pipeline for multipath WWIDs (default: sort -u). Example: "sort -t- -k2 -n"
-#   POOL_SETUP_LOG   Log file path (default: /tmp/zfs-orcd-<pool>-<timestamp>.log)
+#   MPATH_SORT       dm (default: order by dm-N, like `multipath -l | sort -t- -k2 -n`) | wwid
+#   MPATH_SORT_CMD   Advanced: replace the sort with a pipeline applied to "WWID dm-N alias" rows.
+#   MPATH_DEV_DIR    Device dir used to resolve/verify multipath members (default /dev/mapper)
+#   ZPOOL_DEV_NAMES  short (default: members passed as bare WWID / nvme-<Model>_<SN> names) | full (absolute paths)
+#   POOL_SETUP_LOG   Log file path (default: /var/log/zfs-orcd/zfs-orcd-<pool>-<timestamp>.log, else /tmp)
 #   SKIP_CONFIRM=1   Skip the interactive confirmation before zpool create (non-interactive / automation)
 #
 # Multipath / HDD discovery (default: WWID-first maps, friendly names off):
 #   SKIP_MPATH_MPATHCONF=1   Do not run mpathconf or restart multipathd (use existing host config)
-#   MPATH_USER_FRIENDLY_NAMES=1  Assume friendly names (mpathX) may be on: skip mpathconf and use broader
-#                                multipath -l parsing (WWID from mpath line or WWID+dm- line)
+#   MPATH_USER_FRIENDLY_NAMES=1  Allow mpathX aliases to remain (skip mpathconf; members then go via
+#                                /dev/disk/by-id/dm-uuid-mpath-<WWID>). NOT recommended — ORCD pools use WWID names.
 #
 # Special vdev (mpath pools only): four smallest unused NVMe → log+cache; largest remainder → special.
 #   Run with --help-special for layout choices. Losing the entire special vdev loses the pool — use mirrors in prod.
 #
 set -euo pipefail
 
+# Bash 4+ is required (associative arrays, ${var,,}); check before anything else runs.
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "Error: this script requires bash 4+ (found ${BASH_VERSION}). On RHEL use /bin/bash." >&2
+  exit 1
+fi
+
 DEFAULT_TOTAL_DISKS=78
 DATA_DISK_SOURCE="${DATA_DISK_SOURCE:-mpath}"
 DRAID_PARITY="${DRAID_PARITY:-3}"
 DRAID_PROFILE="${DRAID_PROFILE:-balanced}"
 DRAID_VDEV_SPEC="${DRAID_VDEV_SPEC:-}"
+DRAID_MIN_SPARES="${DRAID_MIN_SPARES:-1}"
 DRY_RUN="${DRY_RUN:-0}"
-MPATH_SORT_CMD="${MPATH_SORT_CMD:-sort -u}"
+SKIP_LOG_CACHE="${SKIP_LOG_CACHE:-0}"
+ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
+HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
+HDD_SPARES=()
+ZFS_ATIME="${ZFS_ATIME:-off}"
+# Number of NVMe reserved for SLOG mirror (2) + L2ARC (2); 0 when SKIP_LOG_CACHE=1.
+AUX_NVME_COUNT=4
+[[ "$SKIP_LOG_CACHE" == "1" ]] && AUX_NVME_COUNT=0
+NVME_LOG=()
+NVME_CACHE=()
+MPATH_SORT="${MPATH_SORT:-dm}"
+MPATH_SORT_CMD="${MPATH_SORT_CMD:-}"
 # 0 = default layout: user_friendly_names n (WWID leads map lines); 1 = allow mpath alias headers
 MPATH_USER_FRIENDLY_NAMES="${MPATH_USER_FRIENDLY_NAMES:-0}"
 SPECIAL="${SPECIAL:-}"
@@ -72,26 +103,79 @@ CLI_POSITIONAL=()
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 fn=$(basename "$0")
 
+# Pool name rule: hostname ending in n1-mgmt → data1, n2-mgmt → data2 (e.g. hstor004-n1-mgmt → data1);
+# anything else → data1. POOL_NAME_SOURCE records where the name came from for the verification prompt.
+POOL_NAME_SOURCE=""
 default_pool_name_from_host() {
   local h
   h=$(hostname -s 2>/dev/null || hostname)
   h="${h%%.*}"
+  h="${h,,}"
   case "$h" in
-    *-n1 | *_n1) echo data1 ;;
-    *-n2 | *_n2) echo data2 ;;
-    *) echo "$h" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '_' ;;
+    *n1-mgmt | *n1_mgmt) POOL_NAME_SOURCE="hostname '${h}' ends with n1-mgmt"; POOL=data1 ;;
+    *n2-mgmt | *n2_mgmt) POOL_NAME_SOURCE="hostname '${h}' ends with n2-mgmt"; POOL=data2 ;;
+    *) POOL_NAME_SOURCE="hostname '${h}' does not end with n1-mgmt/n2-mgmt → fallback"; POOL=data1 ;;
   esac
 }
 
-if [[ -z "${POOL:-}" ]]; then
+if [[ -n "${POOL:-}" ]]; then
+  POOL_NAME_SOURCE="POOL environment variable"
+else
   _pool_from_fn=$(echo "$fn" | cut -d'.' -f1)
   if [[ "$_pool_from_fn" == zfs-draid* ]]; then
-    POOL=$(default_pool_name_from_host)
+    default_pool_name_from_host
   else
     POOL="$_pool_from_fn"
+    POOL_NAME_SOURCE="script file name '${fn}'"
   fi
   unset _pool_from_fn
 fi
+
+valid_zpool_name() {
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_.:-]*$ ]] || return 1
+  case "$1" in
+    mirror* | raidz* | draid* | spare* | log | cache | special | dedup) return 1 ;;
+  esac
+  return 0
+}
+
+# Always verify the pool name before discovery/create (the log file and every command use it).
+# SKIP_CONFIRM=1 or a non-interactive stdin accepts the default without asking.
+prompt_verify_pool_name() {
+  local r
+  echo "Pool name:         ${POOL}   (source: ${POOL_NAME_SOURCE})"
+  pool_must_not_exist "$POOL"
+  if [[ "${SKIP_CONFIRM:-0}" == "1" ]]; then
+    echo "SKIP_CONFIRM=1 — using pool name '${POOL}' without asking."
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "Note: stdin is not a terminal — using pool name '${POOL}' (set POOL= to override)."
+    return 0
+  fi
+  while :; do
+    read -r -p "Verify pool name — press Enter to keep '${POOL}', or type another name: " r || true
+    r="${r//[[:space:]]/}"
+    if [[ -z "$r" ]]; then
+      break
+    fi
+    if valid_zpool_name "$r"; then
+      POOL="$r"
+      POOL_NAME_SOURCE="entered at prompt"
+      break
+    fi
+    echo "  '${r}' is not a valid pool name (letters/digits/_ . : -, must start with a letter, not a vdev keyword)." >&2
+  done
+  pool_must_not_exist "$POOL"
+  echo "Using pool name:   ${POOL}"
+}
+
+pool_must_not_exist() {
+  if command -v zpool >/dev/null 2>&1 && zpool list -H -o name 2>/dev/null | grep -qx -- "$1"; then
+    echo "Error: a pool named '${1}' already exists on this host (zpool list). Choose another name with POOL=." >&2
+    exit 1
+  fi
+}
 
 special_layout_help() {
   cat <<'EOF'
@@ -148,8 +232,9 @@ usage() {
   echo "  total_hdd_count      Data disks for the dRAID vdev(s) (default: ${DEFAULT_TOTAL_DISKS} for mpath;"
   echo "                         for nvme use the large-capacity count, e.g. 20). Must be a multiple of DISKS_PER_VDEV."
   echo
-  echo "Key env: DATA_DISK_SOURCE=mpath|nvme  DRAID_PARITY=2|3  DRAID_PROFILE=balanced|capacity"
-  echo "         SPECIAL=Y|layout  SPECIAL_VDEV=layout  SPECIAL_PATTERN=substring  DRY_RUN=1"
+  echo "Key env: DATA_DISK_SOURCE=mpath|nvme  DRAID_PARITY=2|3  DRAID_PROFILE=balanced|capacity  DRAID_MIN_SPARES=0..2"
+  echo "         SPECIAL=Y|layout  SPECIAL_VDEV=layout  SPECIAL_PATTERN=substring  DRY_RUN=1  SKIP_LOG_CACHE=1"
+  echo "         DISKS_PER_VDEV=N  HDD_SPARE_COUNT=N  DRAID_VDEV_SPEC=draidP:Dd:Cc:Ss  ZPOOL_FORCE=1  SKIP_CONFIRM=1"
   echo "By default a create run applies: mpathconf --enable --user_friendly_names n (unless"
   echo "SKIP_MPATH_MPATHCONF=1 or MPATH_USER_FRIENDLY_NAMES=1; skipped for nvme data)."
   echo "Assessment mode never changes host config."
@@ -167,7 +252,6 @@ normalize_special_layout() {
     raidz3 | raidz3x20) echo "raidz3x20" ;;
     mirror9 | mirror9x2spare | mirror9+2spare) echo "mirror9+2spare" ;;
     raidz2-18 | raidz2x18 | raidz2x18+2spare | raidz2-18+2spare) echo "raidz2-18+2spare" ;;
-    mirror10 | mirror5 | mirror8 | raidz2x10 | raidz3x20 | mirror9+2spare | raidz2-18+2spare) echo "${1,,}" ;;
     *)
       echo "Error: unknown special vdev layout '${1}' (try --help-special)." >&2
       return 1
@@ -207,10 +291,6 @@ special_layout_nvme_total() {
   special=$(special_layout_special_disk_count "$1") || return 1
   spares=$(special_layout_pool_spare_count "$1") || return 1
   echo $((special + spares))
-}
-
-special_layout_disk_count() {
-  special_layout_special_disk_count "$1"
 }
 
 special_layout_summary() {
@@ -306,6 +386,7 @@ parse_cli_args() {
   fi
 }
 
+ORIG_ARGV=("$@")
 parse_cli_args "$@"
 if ((${#CLI_POSITIONAL[@]} > 0)); then
   set -- "${CLI_POSITIONAL[@]}"
@@ -313,9 +394,24 @@ else
   set --
 fi
 
-if ((BASH_VERSINFO[0] < 4)); then
-  echo "Error: this script requires bash 4+ (found ${BASH_VERSION}). On RHEL use /bin/bash." >&2
+if [[ "$MPATH_SORT" != dm && "$MPATH_SORT" != wwid ]]; then
+  echo "Error: MPATH_SORT must be 'dm' or 'wwid' (got '${MPATH_SORT}')." >&2
   exit 1
+fi
+
+if [[ "$DATA_DISK_SOURCE" != mpath && "$DATA_DISK_SOURCE" != nvme ]]; then
+  echo "Error: DATA_DISK_SOURCE must be 'mpath' or 'nvme' (got '${DATA_DISK_SOURCE}')." >&2
+  exit 1
+fi
+
+# Device sizes (blockdev), blkid probing and multipath queries need root; assessment degrades silently otherwise.
+if (( EUID != 0 )); then
+  if [[ "$ASSESS_ONLY" == "1" ]] || [[ $# -lt 1 ]]; then
+    echo "Warning: not running as root — device sizes/status may be missing or wrong in the assessment." >&2
+  else
+    echo "Error: pool creation (and DRY_RUN discovery) must run as root." >&2
+    exit 1
+  fi
 fi
 
 if [[ "$ASSESS_ONLY" == "1" ]] || [[ $# -lt 1 ]]; then
@@ -333,18 +429,43 @@ else
     exit 1
   fi
 
+  if ! [[ "$TOTAL_DISKS" =~ ^[0-9]+$ ]] || (( TOTAL_DISKS < 1 )); then
+    echo "Error: total_hdd_count must be a positive integer (got '${TOTAL_DISKS}')." >&2
+    exit 1
+  fi
+
   if [[ "$DATA_DISK_SOURCE" == nvme ]]; then
     DISKS_PER_VDEV="${DISKS_PER_VDEV:-$TOTAL_DISKS}"
   fi
   DISKS_PER_VDEV="${DISKS_PER_VDEV:-26}"
+
+  if ! [[ "$HDD_SPARE_COUNT" =~ ^[0-9]+$ ]]; then
+    echo "Error: HDD_SPARE_COUNT must be a non-negative integer (got '${HDD_SPARE_COUNT}')." >&2
+    exit 1
+  fi
+
+  if ! [[ "$DISKS_PER_VDEV" =~ ^[0-9]+$ ]] || (( DISKS_PER_VDEV < 1 )); then
+    echo "Error: DISKS_PER_VDEV must be a positive integer (got '${DISKS_PER_VDEV}')." >&2
+    exit 1
+  fi
 
   if [[ "$DRAID_PARITY" != 2 && "$DRAID_PARITY" != 3 ]]; then
     echo "Error: DRAID_PARITY must be 2 or 3 (got '${DRAID_PARITY}')." >&2
     exit 1
   fi
 
-  if ! [[ "$TOTAL_DISKS" =~ ^[0-9]+$ ]] || (( TOTAL_DISKS < DISKS_PER_VDEV )); then
-    echo "Error: total_hdd_count must be an integer >= ${DISKS_PER_VDEV}." >&2
+  if [[ "$DRAID_PROFILE" != balanced && "$DRAID_PROFILE" != capacity ]]; then
+    echo "Error: DRAID_PROFILE must be 'balanced' or 'capacity' (got '${DRAID_PROFILE}')." >&2
+    exit 1
+  fi
+
+  if ! [[ "$DRAID_MIN_SPARES" =~ ^[0-9]+$ ]] || (( DRAID_MIN_SPARES > 2 )); then
+    echo "Error: DRAID_MIN_SPARES must be 0, 1 or 2 (got '${DRAID_MIN_SPARES}')." >&2
+    exit 1
+  fi
+
+  if (( TOTAL_DISKS < DISKS_PER_VDEV )); then
+    echo "Error: total_hdd_count (${TOTAL_DISKS}) must be >= DISKS_PER_VDEV (${DISKS_PER_VDEV})." >&2
     exit 1
   fi
 
@@ -361,9 +482,19 @@ else
       exit 1
     fi
   fi
+
+  for _tool in zpool zfs lsblk blkid blockdev; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+      echo "Error: '${_tool}' not found in PATH (install zfs / util-linux)." >&2
+      exit 1
+    fi
+  done
+  unset _tool
 fi
 
-# --- Default multipath: friendly names off (WWID-first map lines), unless opted out ---
+# --- Multipath naming: WWID map names (user_friendly_names n) are REQUIRED for the data pool ---
+# The pool must reference maps by WWID (35000c500…), never by mpathX alias, so that `zpool status`
+# and /dev/mapper are stable across hosts/reboots and match the SAS enclosure inventory.
 apply_multipath_user_friendly_names_off() {
   if [[ "${DATA_DISK_SOURCE:-mpath}" == nvme ]]; then
     echo "Note: DATA_DISK_SOURCE=nvme — skipping mpathconf / multipathd (data disks are local NVMe)."
@@ -382,7 +513,7 @@ apply_multipath_user_friendly_names_off() {
     return 0
   fi
   if ! command -v mpathconf >/dev/null 2>&1; then
-    echo "Warning: mpathconf not in PATH; cannot apply --user_friendly_names n (install multipath-tools)." >&2
+    echo "Warning: mpathconf not in PATH; cannot apply --user_friendly_names n (install device-mapper-multipath)." >&2
     return 0
   fi
   echo "Applying multipath defaults: mpathconf --enable --user_friendly_names n"
@@ -393,107 +524,155 @@ apply_multipath_user_friendly_names_off() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl try-restart multipathd 2>/dev/null || systemctl restart multipathd 2>/dev/null || true
   fi
+  # Existing maps keep their mpathX alias until reloaded; -r re-reads the config and renames them.
+  multipath -r >/dev/null 2>&1 || true
+  sleep 2
   return 0
 }
 
-# --- HDD discovery: prefer multipathd WWID list, then multipath -l stanza walk ---
-# With user_friendly_names n, map headers look like: <WWID> dm-N VENDOR,PRODUCT
+# --- HDD discovery: single `multipath -l` pass → "WWID dm-N" rows ---
+# Map headers:  user_friendly_names n:  35000c500f3d79da3 dm-12 SEAGATE,ST20000NM002H
+#               user_friendly_names y:  mpatha (35000c500f3d79da3) dm-12 SEAGATE,ST20000NM002H
+# Both forms are parsed (the WWID is always what we keep), but create mode refuses to proceed while
+# aliases are still active unless MPATH_USER_FRIENDLY_NAMES=1 explicitly allows it.
 extract_wwid_from_mpath_header() {
   local line=$1
-  if [[ "${MPATH_USER_FRIENDLY_NAMES:-0}" != "1" ]]; then
-    if [[ "$line" =~ ^([0-9A-Fa-f]{8,})\ +dm-[0-9]+ ]]; then
-      echo "${BASH_REMATCH[1]}"
-    fi
-    return 0
-  fi
-  if [[ "$line" =~ ^mpath[a-zA-Z0-9_]+\ +\(([0-9A-Fa-f]+)\) ]]; then
+  if [[ "$line" =~ ^([0-9A-Fa-f]{8,})[[:space:]]+dm-[0-9]+ ]]; then
     echo "${BASH_REMATCH[1]}"
-  elif [[ "$line" =~ ^([0-9A-Fa-f]{8,})\ +dm- ]]; then
+  elif [[ "$line" =~ ^mpath[a-zA-Z0-9_]+[[:space:]]+\(([0-9A-Fa-f]{8,})\)[[:space:]]+dm-[0-9]+ ]]; then
     echo "${BASH_REMATCH[1]}"
   elif [[ "$line" =~ \(([0-9A-Fa-f]{8,})\) ]]; then
     echo "${BASH_REMATCH[1]}"
   fi
 }
 
-# Primary: ask multipathd for WWIDs, then filter maps whose "multipath -l <wwid>" text matches the pattern.
-collect_multipath_wwids_via_mpathd() {
-  local pat_lc wwid
-  pat_lc=$(echo "$DISK_PATTERN" | tr '[:upper:]' '[:lower:]')
-  command -v multipathd >/dev/null 2>&1 || return 1
-  multipathd show daemon >/dev/null 2>&1 || return 1
-  multipathd show maps format "%w" 2>/dev/null |
-    while IFS= read -r wwid; do
-      [[ -z "$wwid" ]] && continue
-      [[ "$wwid" =~ ^[0-9A-Fa-f]+$ ]] || continue
-      if multipath -l "$wwid" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qF -- "$pat_lc"; then
-        echo "$wwid"
-      fi
-    done
+mpath_header_is_alias() {
+  [[ "$1" =~ ^mpath[a-zA-Z0-9_]+[[:space:]] ]]
 }
 
-# Fallback: full multipath -l parse (stanza matches pattern; header yields WWID per extract_wwid rules).
-collect_multipath_wwids_multipath_l() {
-  local pat_lc stanza line ll wwid
+# Emits "WWID dm-N alias|-" for every map whose full stanza matches DISK_PATTERN (case-insensitive).
+collect_multipath_maps_matching() {
+  local pat_lc stanza line ll wwid hdr dmn alias
   pat_lc=$(echo "$DISK_PATTERN" | tr '[:upper:]' '[:lower:]')
   stanza=""
+  emit_stanza() {
+    [[ -n "$stanza" ]] || return 0
+    ll=$(echo "$stanza" | tr '[:upper:]' '[:lower:]')
+    [[ "$ll" == *"${pat_lc}"* ]] || return 0
+    hdr=$(printf '%s\n' "$stanza" | head -n1)
+    wwid=$(extract_wwid_from_mpath_header "$hdr")
+    [[ -n "$wwid" ]] || return 0
+    dmn=""
+    [[ "$hdr" =~ (dm-[0-9]+) ]] && dmn="${BASH_REMATCH[1]}"
+    alias="-"
+    mpath_header_is_alias "$hdr" && alias="${hdr%% *}"
+    echo "${wwid} ${dmn:-dm-?} ${alias}"
+  }
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ dm-[0-9]+ ]] && [[ ! "$line" =~ ^[[:space:]] ]]; then
-      if [[ -n "$stanza" ]]; then
-        ll=$(echo "$stanza" | tr '[:upper:]' '[:lower:]')
-        if [[ "$ll" == *"${pat_lc}"* ]]; then
-          wwid=$(extract_wwid_from_mpath_header "$(echo "$stanza" | head -n1)")
-          [[ -n "$wwid" ]] && echo "$wwid"
-        fi
-      fi
+      emit_stanza
       stanza="$line"
     else
       stanza+=$'\n'"$line"
     fi
   done < <(multipath -l 2>/dev/null || true)
-  if [[ -n "$stanza" ]]; then
-    ll=$(echo "$stanza" | tr '[:upper:]' '[:lower:]')
-    if [[ "$ll" == *"${pat_lc}"* ]]; then
-      wwid=$(extract_wwid_from_mpath_header "$(echo "$stanza" | head -n1)")
-      [[ -n "$wwid" ]] && echo "$wwid"
-    fi
-  fi
+  emit_stanza
+  unset -f emit_stanza
 }
 
+# Ordered WWID list for the pool. MPATH_SORT=dm (default) orders by dm-N — the same order as
+#   multipath -l | grep VENDOR | sort -t '-' -k 2 -n
+# so vdev membership matches the hand-built command. MPATH_SORT=wwid sorts by WWID instead.
+# MPATH_SORT_CMD (advanced) replaces the sort entirely and is applied to the "WWID dm-N alias" rows.
 collect_multipath_wwids_all() {
-  local via_mpathd
-  via_mpathd=$(collect_multipath_wwids_via_mpathd 2>/dev/null | sort -u || true)
-  if [[ -n "$via_mpathd" ]]; then
-    echo "$via_mpathd"
-    return 0
+  local rows
+  rows=$(collect_multipath_maps_matching)
+  [[ -n "$rows" ]] || return 0
+  if [[ -n "${MPATH_SORT_CMD:-}" ]]; then
+    printf '%s\n' "$rows" | eval "$MPATH_SORT_CMD" | awk '{print $1}' | awk '!seen[$0]++'
+  elif [[ "${MPATH_SORT:-dm}" == wwid ]]; then
+    printf '%s\n' "$rows" | awk '{print $1}' | sort -u
+  else
+    printf '%s\n' "$rows" | sort -t- -k2,2n | awk '{print $1}' | awk '!seen[$0]++'
   fi
-  echo "Note: multipathd WWID discovery unavailable or empty — falling back to multipath -l stanza scan." >&2
-  collect_multipath_wwids_multipath_l
 }
 
-# Resolve a multipath WWID to a stable path for zpool
+# Aliases still active? Returns the count (0 = all WWID-named).
+count_multipath_alias_maps() {
+  collect_multipath_maps_matching | awk '$3 != "-"' | wc -l | tr -d ' '
+}
+
+# Resolve a multipath WWID to the device node handed to zpool.
+# Default MPATH_DEV_DIR=/dev/mapper so `zpool status` shows bare WWIDs (35000c500f3d79da3), exactly like the
+# hand-built raidz3 command. The by-id dm-uuid-mpath-* link is the fallback (same dm device, longer name).
+# Only device-mapper nodes are acceptable: wwn-0x*/scsi-* links point at a single SCSI path (sdX) and
+# would bypass multipath, so they are deliberately not used.
+MPATH_DEV_DIR="${MPATH_DEV_DIR:-/dev/mapper}"
 resolve_mpath_device() {
   local wwid=$1
   local p
   for p in \
+    "${MPATH_DEV_DIR}/${wwid}" \
+    "/dev/mapper/${wwid}" \
     "/dev/disk/by-id/dm-uuid-mpath-${wwid}" \
-    "/dev/disk/by-id/wwn-0x${wwid}"; do
+    "/dev/disk/by-id/dm-name-${wwid}"; do
     if [[ -b "$p" ]]; then
       echo "$p"
       return 0
     fi
   done
-  for p in /dev/disk/by-id/scsi-*"${wwid}"*; do
-    if [[ -b "$p" ]]; then
-      echo "$p"
-      return 0
-    fi
-  done
-  if [[ -b "/dev/mapper/${wwid}" ]]; then
-    echo "/dev/mapper/${wwid}"
-    return 0
-  fi
-  echo "Error: could not resolve multipath WWID ${wwid} to a block device under /dev/disk/by-id or /dev/mapper." >&2
+  echo "Error: could not resolve multipath WWID ${wwid} to a device-mapper node (/dev/mapper/<wwid>, dm-uuid-mpath-*)." >&2
   return 1
+}
+
+# --- Shared "is this block device in use?" probe ---
+# Prints a short reason (partitioned, mounted:/x, swap, zfs_member, fstype:xfs, holder:lvm, not-disk:part)
+# and returns 1 when the device must not be given to zpool; prints nothing and returns 0 when it looks free.
+# Partition tables and child devices (partitions, LVM/md holders) are what the original checks missed —
+# a partitioned OS NVMe with only its partitions mounted looked "unused".
+device_in_use_reason() {
+  local dev=$1
+  local btype mp fstype type pttype nchildren
+  [[ -b "$dev" ]] || { echo "unresolved"; return 1; }
+  btype=$(lsblk -dn -o TYPE "$dev" 2>/dev/null || true)
+  if [[ -n "${btype:-}" && "$btype" != disk && "$btype" != mpath ]]; then
+    echo "not-disk:${btype}"
+    return 1
+  fi
+  mp=$(lsblk -dn -o MOUNTPOINT "$dev" 2>/dev/null || true)
+  if [[ -n "${mp:-}" ]]; then
+    echo "mounted:${mp}"
+    return 1
+  fi
+  fstype=$(lsblk -dn -o FSTYPE "$dev" 2>/dev/null || true)
+  case "${fstype:-}" in
+    "") ;;
+    swap) echo "swap"; return 1 ;;
+    zfs_member) echo "zfs_member"; return 1 ;;
+    LVM2_member | linux_raid_member | crypto_LUKS) echo "holder:${fstype}"; return 1 ;;
+    *) echo "fstype:${fstype}"; return 1 ;;
+  esac
+  # Probe directly (bypasses the blkid cache, which can be stale right after wipefs/zpool destroy).
+  type=$(blkid -p -o value -s TYPE "$dev" 2>/dev/null || blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+  if [[ -n "${type:-}" ]]; then
+    [[ "$type" == zfs_member ]] && echo "zfs_member" || echo "fstype:${type}"
+    return 1
+  fi
+  pttype=$(lsblk -dn -o PTTYPE "$dev" 2>/dev/null || true)
+  if [[ -z "${pttype:-}" ]]; then
+    pttype=$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)
+  fi
+  if [[ -n "${pttype:-}" ]]; then
+    echo "partitioned:${pttype}"
+    return 1
+  fi
+  # Children = partitions or holders (LVM LVs, md, dm-crypt) stacked on the device.
+  nchildren=$(lsblk -rn -o NAME "$dev" 2>/dev/null | wc -l | tr -d ' ')
+  if (( ${nchildren:-1} > 1 )); then
+    echo "has-children"
+    return 1
+  fi
+  return 0
 }
 
 # --- NVMe: unused whole-disk by-id paths, size from blockdev ---
@@ -508,28 +687,36 @@ nvme_by_id_candidates() {
 }
 
 is_nvme_unused_for_zfs() {
-  local dev=$1
-  local mp type fstype btype
+  local dev=$1 btype
   btype=$(lsblk -dn -o TYPE "$dev" 2>/dev/null || true)
-  if [[ "${btype:-}" != disk ]]; then
-    return 1
-  fi
-  mp=$(lsblk -dn -o MOUNTPOINT "$dev" 2>/dev/null || true)
-  if [[ -n "${mp:-}" ]]; then
-    return 1
-  fi
-  fstype=$(lsblk -dn -o FSTYPE "$dev" 2>/dev/null || true)
-  if [[ "${fstype:-}" == swap ]]; then
-    return 1
-  fi
-  type=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
-  if [[ "${type:-}" == zfs_member ]]; then
-    return 1
-  fi
-  return 0
+  [[ "${btype:-}" == disk ]] || return 1
+  device_in_use_reason "$dev" >/dev/null
 }
 
-# Pick one stable by-id symlink per backing device (nvme-* and nvme-eui.* often duplicate the same disk).
+# Rank of an NVMe by-id link: 0 = nvme-<Model>_<SN> (the ORCD naming convention, e.g.
+# nvme-MTFDLAL7T6THG-1BP1DFCYY_112611AE997D), 1 = nvme-<Model>_<SN>_<ns> namespace-suffixed variant,
+# 2 = nvme-eui.* / nvme-nvme.* opaque ids. Lower is preferred; ties broken lexically.
+nvme_by_id_rank() {
+  local b
+  b=$(basename "$1")
+  case "$b" in
+    nvme-eui.* | nvme-nvme.* | nvme-uuid.*) echo 2 ;;
+    nvme-*_*_[0-9] | nvme-*_*_[0-9][0-9]) echo 1 ;;
+    nvme-*_*) echo 0 ;;
+    *) echo 3 ;;
+  esac
+}
+
+nvme_by_id_better() { # $1 candidate, $2 current best → true if candidate preferred
+  local r1 r2
+  r1=$(nvme_by_id_rank "$1")
+  r2=$(nvme_by_id_rank "$2")
+  (( r1 < r2 )) && return 0
+  (( r1 > r2 )) && return 1
+  [[ "$1" < "$2" ]]
+}
+
+# Pick one stable by-id symlink per backing device (nvme-<Model>_<SN> preferred over nvme-eui.*).
 pick_unique_nvme_by_id_paths() {
   declare -A best_id_for_real=()
   local f real best
@@ -539,7 +726,7 @@ pick_unique_nvme_by_id_paths() {
     real=$(readlink -f "$f" 2>/dev/null || true)
     [[ -n "$real" && -b "$real" ]] || continue
     best="${best_id_for_real[$real]:-}"
-    if [[ -z "$best" || "$f" < "$best" ]]; then
+    if [[ -z "$best" ]] || nvme_by_id_better "$f" "$best"; then
       best_id_for_real[$real]="$f"
     fi
   done < <(nvme_by_id_candidates | sort -u)
@@ -589,13 +776,20 @@ discover_nvme_aux_vdevs() {
     rows+=("${sz} ${f}")
   done < <(pick_unique_nvme_by_id_paths | sort)
 
-  mapfile -t sorted_asc < <(printf '%s\n' "${rows[@]}" | sort -k1,1n)
+  # printf over an empty array still emits one blank line; guard so n is really 0.
+  if ((${#rows[@]} > 0)); then
+    mapfile -t sorted_asc < <(printf '%s\n' "${rows[@]}" | sort -k1,1n)
+  fi
   n=${#sorted_asc[@]}
-  need=$((4 + nvme_total))
+  need=$((AUX_NVME_COUNT + nvme_total))
 
   if (( nvme_total == 0 )); then
-    if (( n < 4 )); then
-      echo "Error: need at least 4 unused whole-disk NVMe devices for log+cache; found ${n} unique disk(s) after by-id dedupe." >&2
+    if (( AUX_NVME_COUNT == 0 )); then
+      echo "Note: SKIP_LOG_CACHE=1 and no special vdev requested — pool will have no NVMe vdevs." >&2
+      return 0
+    fi
+    if (( n < AUX_NVME_COUNT )); then
+      echo "Error: need at least ${AUX_NVME_COUNT} unused whole-disk NVMe devices for log+cache; found ${n} unique disk(s) after by-id dedupe." >&2
       if (( n > 0 )); then
         printf '  %s\n' "${sorted_asc[@]}" >&2
       fi
@@ -605,43 +799,50 @@ discover_nvme_aux_vdevs() {
       fi
       exit 1
     fi
-    if (( n > 4 )); then
-      echo "Note: ${n} unused NVMe found — using 4 smallest for log+cache. Re-run with --special (or SPECIAL=Y) to put remaining NVMe in a special vdev (recommended)." >&2
+    if (( n > AUX_NVME_COUNT )); then
+      echo "Note: ${n} unused NVMe found — using ${AUX_NVME_COUNT} smallest for log+cache. Re-run with --special (or SPECIAL=Y) to put remaining NVMe in a special vdev (recommended)." >&2
     fi
   elif (( n < need )); then
-    echo "Error: need at least ${need} unused whole-disk NVMe (${n} found): 4 for log+cache + ${nvme_total} for special layout ${SPECIAL_LAYOUT} (${special_count} special + ${spare_count} pool spare)." >&2
+    echo "Error: need at least ${need} unused whole-disk NVMe (${n} found): ${AUX_NVME_COUNT} for log+cache + ${nvme_total} for special layout ${SPECIAL_LAYOUT} (${special_count} special + ${spare_count} pool spare)." >&2
     if (( n > 0 )); then
       printf '  %s\n' "${sorted_asc[@]}" >&2
     fi
     exit 1
   fi
 
-  read -r s0 p0 <<<"${sorted_asc[0]}"
-  read -r s1 p1 <<<"${sorted_asc[1]}"
-  read -r s2 p2 <<<"${sorted_asc[2]}"
-  read -r s3 p3 <<<"${sorted_asc[3]}"
-  NVME_LOG=("$p0" "$p1")
-  NVME_CACHE=("$p2" "$p3")
+  if (( AUX_NVME_COUNT == 4 )); then
+    read -r s0 p0 <<<"${sorted_asc[0]}"
+    read -r s1 p1 <<<"${sorted_asc[1]}"
+    read -r s2 p2 <<<"${sorted_asc[2]}"
+    read -r s3 p3 <<<"${sorted_asc[3]}"
+    NVME_LOG=("$p0" "$p1")
+    NVME_CACHE=("$p2" "$p3")
+    if [[ "$s0" != "$s1" ]]; then
+      echo "Warning: SLOG mirror members differ in size ($s0 vs $s1 bytes); the mirror is limited to the smaller one." >&2
+    fi
+    : "$s2" "$s3"
+  fi
 
   if (( nvme_total == 0 )); then
     return 0
   fi
 
   if (( n > need )); then
-    echo "Note: ${n} NVMe available — 4 smallest for log+cache, ${nvme_total} largest eligible for special tier (${SPECIAL_LAYOUT}: ${special_count} special + ${spare_count} pool spare)." >&2
+    echo "Note: ${n} NVMe available — ${AUX_NVME_COUNT} reserved for log+cache, ${nvme_total} largest eligible for special tier (${SPECIAL_LAYOUT}: ${special_count} special + ${spare_count} pool spare)." >&2
   fi
 
+  # Candidates after the log/cache reservation, filtered by SPECIAL_PATTERN, largest first. Keep the
+  # size-descending order (then path) so mirror pairs are formed from equally sized disks.
   mapfile -t tier_rows < <(
-    printf '%s\n' "${sorted_asc[@]:4}" |
+    printf '%s\n' "${sorted_asc[@]:AUX_NVME_COUNT}" |
       while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         read -r sz path <<<"$row"
         nvme_path_matches_special_pattern "$path" || continue
         echo "$row"
       done |
-      sort -k1,1nr |
-      head -n "$nvme_total" |
-      sort -k2
+      sort -k1,1nr -k2,2 |
+      head -n "$nvme_total"
   )
 
   if ((${#tier_rows[@]} != nvme_total)); then
@@ -659,14 +860,22 @@ discover_nvme_aux_vdevs() {
     special_rows=("${tier_rows[@]}")
   fi
 
+  local -a special_sizes=()
+  local row
   for row in "${special_rows[@]}"; do
     read -r sz f <<<"$row"
     NVME_SPECIAL+=("$f")
+    special_sizes+=("$sz")
   done
   for row in "${spare_rows[@]}"; do
     read -r sz f <<<"$row"
     NVME_POOL_SPARE+=("$f")
   done
+
+  # Mixed sizes inside the special tier: warn (mirrors/raidz are capped at the smallest member).
+  if ((${#special_sizes[@]} > 1)) && [[ "${special_sizes[0]}" != "${special_sizes[-1]}" ]]; then
+    echo "Warning: special vdev members are not all the same size ($(human_bytes "${special_sizes[-1]}") … $(human_bytes "${special_sizes[0]}")); consider SPECIAL_PATTERN to select one model." >&2
+  fi
 }
 
 append_special_vdev_to_zpool_cmd() {
@@ -706,45 +915,34 @@ append_special_vdev_to_zpool_cmd() {
 
 # OpenZFS dRAID: (children - spares) must be a multiple of (data + parity); see dRAID Howto.
 # Balanced profile prefers at least two internal redundancy groups when possible, then D≈8, then spare count.
+# At least DRAID_MIN_SPARES (default 1) distributed spares are required: without them dRAID loses its
+# fast sequential rebuild and behaves like a wide RAIDZ. Set DRAID_MIN_SPARES=0 to allow 0s layouts.
 compute_best_draid_spec() {
   local C=$1 P=$2 profile=$3
-  local D S w r g data pen key best="" best_key=-2147483648
-  local found_multi=0 eff_min dd
+  local D S w r g data pen bonus key best="" best_key=-2147483648 dd
+  local s_min="${DRAID_MIN_SPARES:-1}"
 
-  for ((S = 0; S <= 2; S++)); do
+  # Score = data disks (×10000) − stripe-width penalty + multi-group bonus + tiny spare tiebreak.
+  # balanced: penalise |D−8| (2000/disk ≈ 0.2 data disk) and reward ≥2 redundancy groups (+25% of data disks),
+  #           so 26c/P3 → 9d:2s (2 groups) rather than one 22-wide stripe or a 1d:2s degenerate layout.
+  # capacity: raw data disks only (still honours DRAID_MIN_SPARES).
+  for ((S = s_min; S <= 2; S++)); do
     (( C > S + P + 1 )) || continue
     for ((D = C - S - P; D >= 1; D--)); do
       w=$((D + P))
       r=$(( (C - S) % w ))
       (( r != 0 )) && continue
       g=$(( (C - S) / w ))
-      (( g >= 2 )) && found_multi=1
-    done
-  done
-
-  if [[ "$profile" == capacity ]]; then
-    eff_min=1
-  else
-    eff_min=2
-    (( found_multi == 0 )) && eff_min=1
-  fi
-
-  for ((S = 0; S <= 2; S++)); do
-    (( C > S + P + 1 )) || continue
-    for ((D = C - S - P; D >= 1; D--)); do
-      w=$((D + P))
-      r=$(( (C - S) % w ))
-      (( r != 0 )) && continue
-      g=$(( (C - S) / w ))
-      (( g < eff_min )) && continue
       data=$((D * g))
       pen=0
+      bonus=0
       if [[ "$profile" == balanced ]]; then
         dd=$((D - 8))
-        [[ $dd -lt 0 ]] && dd=$((0 - dd))
-        pen=$((dd * 25))
+        (( dd < 0 )) && dd=$((0 - dd))
+        pen=$((dd * 2000))
+        (( g >= 2 )) && bonus=$((data * 2500))
       fi
-      key=$((data * 10000 - pen + S * 5))
+      key=$((data * 10000 - pen + bonus + S * 5))
       if [[ -z "$best" || $key -gt $best_key ]]; then
         best="draid${P}:${D}d:${C}c:${S}s"
         best_key=$key
@@ -753,7 +951,7 @@ compute_best_draid_spec() {
   done
 
   if [[ -z "$best" ]]; then
-    echo "Error: no valid dRAID layout for children=${C} parity=${P} profile=${profile} (need (children-spares) % (data+parity)==0)." >&2
+    echo "Error: no valid dRAID layout for children=${C} parity=${P} profile=${profile} min_spares=${s_min} (need (children-spares) % (data+parity)==0)." >&2
     return 1
   fi
   printf '%s' "$best"
@@ -773,9 +971,11 @@ discover_nvme_data_and_four_aux() {
     rows+=("${sz} ${f}")
   done < <(pick_unique_nvme_by_id_paths | sort)
 
-  mapfile -t sorted_desc < <(printf '%s\n' "${rows[@]}" | sort -k1,1nr)
+  if ((${#rows[@]} > 0)); then
+    mapfile -t sorted_desc < <(printf '%s\n' "${rows[@]}" | sort -k1,1nr)
+  fi
   n=${#sorted_desc[@]}
-  need=$((TOTAL_DISKS + 4))
+  need=$((TOTAL_DISKS + AUX_NVME_COUNT))
   if ((n < need)); then
     echo "Error: need at least ${need} unused whole-disk NVMe devices matching '${DISK_PATTERN}' (found ${n})." >&2
     if ((n > 0)); then
@@ -784,7 +984,7 @@ discover_nvme_data_and_four_aux() {
     exit 1
   fi
   if ((n > need)); then
-    echo "Note: ${n} NVMe matches — using ${TOTAL_DISKS} largest for dRAID data and the 4 smallest of the remainder for log+cache." >&2
+    echo "Note: ${n} NVMe matches — using ${TOTAL_DISKS} largest for dRAID data and the ${AUX_NVME_COUNT} smallest of the remainder for log+cache." >&2
   fi
 
   ALL_HDD_PATHS=()
@@ -792,6 +992,10 @@ discover_nvme_data_and_four_aux() {
     read -r sz f <<<"${sorted_desc[i]}"
     ALL_HDD_PATHS+=("$f")
   done
+
+  if (( AUX_NVME_COUNT == 0 )); then
+    return 0
+  fi
 
   declare -a tail=("${sorted_desc[@]:TOTAL_DISKS}")
   mapfile -t tail_sorted < <(printf '%s\n' "${tail[@]}" | sort -k1,1n | head -n 4)
@@ -805,9 +1009,13 @@ discover_nvme_data_and_four_aux() {
   read -r s1 p1 <<<"${tail_sorted[1]}"
   read -r s2 p2 <<<"${tail_sorted[2]}"
   read -r s3 p3 <<<"${tail_sorted[3]}"
+  : "$s2" "$s3"
   # Smallest two → SLOG; next two → L2ARC (same-size disks split 2+2).
   NVME_LOG=("$p0" "$p1")
   NVME_CACHE=("$p2" "$p3")
+  if [[ "$s0" != "$s1" ]]; then
+    echo "Warning: SLOG mirror members differ in size ($s0 vs $s1 bytes); the mirror is limited to the smaller one." >&2
+  fi
 }
 
 # --- Print / log helpers (full command + layout for validation) ---
@@ -837,30 +1045,47 @@ print_visual_pool_layout() {
     n=0
     for d in "${paths[@]}"; do
       ((++n))
-      printf '  [%2d] %s\n' "$n" "$d"
+      printf '  [%2d] %-45s %s\n' "$n" "$(vdev_name "$d")" "$([[ "${ZPOOL_DEV_NAMES:-short}" == short ]] && echo "($d)")"
     done
     echo
   done
-  echo "--- log mirror (SLOG) ---"
-  i=0
-  for d in "${NVME_LOG[@]}"; do
-    ((++i))
-    printf '  [%d] %s\n' "$i" "$d"
-  done
-  echo
-  echo "--- cache (L2ARC) ---"
-  i=0
-  for d in "${NVME_CACHE[@]}"; do
-    ((++i))
-    printf '  [%d] %s\n' "$i" "$d"
-  done
-  echo
+  if ((${#NVME_LOG[@]} > 0)); then
+    echo "--- log mirror (SLOG) ---"
+    i=0
+    for d in "${NVME_LOG[@]}"; do
+      ((++i))
+      printf '  [%d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
+    done
+    echo
+  fi
+  if ((${#NVME_CACHE[@]} > 0)); then
+    echo "--- cache (L2ARC) ---"
+    i=0
+    for d in "${NVME_CACHE[@]}"; do
+      ((++i))
+      printf '  [%d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
+    done
+    echo
+  fi
+  if ((${#NVME_LOG[@]} == 0 && ${#NVME_CACHE[@]} == 0)); then
+    echo "--- log / cache: none (SKIP_LOG_CACHE=1) ---"
+    echo
+  fi
   if (( SPECIAL_ENABLED )); then
     echo "--- special (${SPECIAL_LAYOUT}: $(special_layout_summary "$SPECIAL_LAYOUT")) ---"
     i=0
     for d in "${NVME_SPECIAL[@]}"; do
       ((++i))
-      printf '  [%2d] %s\n' "$i" "$d"
+      printf '  [%2d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
+    done
+    echo
+  fi
+  if ((${#HDD_SPARES[@]} > 0)); then
+    echo "--- pool hot spares (HDD) ---"
+    i=0
+    for d in "${HDD_SPARES[@]}"; do
+      ((++i))
+      printf '  [%d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
     done
     echo
   fi
@@ -869,7 +1094,7 @@ print_visual_pool_layout() {
     i=0
     for d in "${NVME_POOL_SPARE[@]}"; do
       ((++i))
-      printf '  [%d] %s\n' "$i" "$d"
+      printf '  [%d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
     done
     echo
   fi
@@ -910,11 +1135,12 @@ prompt_confirm_zpool_create() {
     return 0
   fi
   if [[ ! -t 0 ]]; then
-    echo "Error: stdin is not a terminal; refusing to destroy ambiguity around zpool create." >&2
+    echo "Error: stdin is not a terminal; refusing to run zpool create without an explicit confirmation." >&2
     echo "Re-run from an interactive shell, or set SKIP_CONFIRM=1 for non-interactive use." >&2
     exit 1
   fi
   local r
+  echo "About to create pool '${POOL}': ${NUM_VDEVS} × ${ONE_DRAID_SPEC} (${TOTAL_DISKS} data disks)${SPECIAL_LAYOUT:+, special ${SPECIAL_LAYOUT}}."
   read -r -p "Confirm to run this zpool create? [y/N] " r || true
   case "${r,,}" in
     y | yes) return 0 ;;
@@ -975,38 +1201,12 @@ assess_extract_wwid() {
 }
 
 assess_block_status() {
-  local dev=$1
-  local btype mp fstype type
-  [[ -b "$dev" ]] || { echo "unresolved"; return; }
-  btype=$(lsblk -dn -o TYPE "$dev" 2>/dev/null || true)
-  if [[ -n "${btype:-}" && "$btype" != disk && "$btype" != mpath ]]; then
-    echo "not-disk:${btype}"
-    return
+  local dev=$1 reason
+  if reason=$(device_in_use_reason "$dev"); then
+    echo "unused"
+  else
+    echo "${reason:-in-use}"
   fi
-  mp=$(lsblk -dn -o MOUNTPOINT "$dev" 2>/dev/null || true)
-  if [[ -n "${mp:-}" ]]; then
-    echo "mounted:${mp}"
-    return
-  fi
-  fstype=$(lsblk -dn -o FSTYPE "$dev" 2>/dev/null || true)
-  if [[ "${fstype:-}" == swap ]]; then
-    echo "swap"
-    return
-  fi
-  if [[ "${fstype:-}" == zfs_member ]]; then
-    echo "zfs_member"
-    return
-  fi
-  type=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
-  if [[ "${type:-}" == zfs_member ]]; then
-    echo "zfs_member"
-    return
-  fi
-  if [[ -n "${fstype:-}" ]]; then
-    echo "fstype:${fstype}"
-    return
-  fi
-  echo "unused"
 }
 
 assess_nvme_model() {
@@ -1041,7 +1241,7 @@ pick_all_nvme_by_id_paths() {
     real=$(readlink -f "$f" 2>/dev/null || true)
     [[ -n "$real" && -b "$real" ]] || continue
     best="${best_id_for_real[$real]:-}"
-    if [[ -z "$best" || "$f" < "$best" ]]; then
+    if [[ -z "$best" ]] || nvme_by_id_better "$f" "$best"; then
       best_id_for_real[$real]="$f"
     fi
   done < <(nvme_by_id_candidates | sort -u)
@@ -1080,19 +1280,47 @@ assess_special_usable_bytes() {
   esac
 }
 
+# Pick the dRAID vdev width for N unused disks. Candidates 8..DRAID_MAX_WIDTH (default 40): the width whose
+# vdevs give the most usable data disks wins (leftover disks become pool hot spares), then stripe width near
+# 8, ≥2 groups, and closeness to the proven 26-wide layout. Widths whose auto spec has a data group outside
+# 4..12 are skipped. Never "one vdev of everything": 106 disks → 4×26 (+2 spares), not 1×106 with 32d stripes.
+DRAID_MAX_WIDTH="${DRAID_MAX_WIDTH:-40}"
 assess_pick_width() {
-  local total=$1 w
-  if (( total >= 26 && total % 26 == 0 )); then
-    echo 26
+  local total=$1 w spec d sp g dd data maxw max_data=0
+  local -a cand_w=() cand_data=() cand_sec=()
+  maxw=$DRAID_MAX_WIDTH
+  (( maxw > total )) && maxw=$total
+  for ((w = 8; w <= maxw; w++)); do
+    spec=$(compute_best_draid_spec "$w" 3 balanced 2>/dev/null) || continue
+    [[ "$spec" =~ ^draid3:([0-9]+)d:[0-9]+c:([0-9]+)s$ ]] || continue
+    d="${BASH_REMATCH[1]}"
+    sp="${BASH_REMATCH[2]}"
+    (( d >= 4 && d <= 12 )) || continue
+    g=$(( (w - sp) / (d + 3) ))
+    data=$(( (total / w) * d * g ))
+    dd=$(( d > 8 ? d - 8 : 8 - d ))
+    cand_w+=("$w")
+    cand_data+=("$data")
+    # secondary: stripe near 8 data disks, ≥2 groups per vdev, few leftover disks, near the proven 26 width
+    cand_sec+=("$(( dd * 10 + (g < 2 ? 30 : 0) + (total % w) * 5 + (w > 26 ? w - 26 : 26 - w) * 2 ))")
+    (( data > max_data )) && max_data=$data
+  done
+  if ((${#cand_w[@]} == 0)); then
+    (( total < 8 )) && { echo "$total"; return; }
+    echo $(( total > maxw ? maxw : total ))
     return
   fi
-  for w in 24 20 16 13 12 18 10 8; do
-    if (( total >= w && total % w == 0 )) && compute_best_draid_spec "$w" 3 balanced >/dev/null 2>&1; then
-      echo "$w"
-      return
+  # Capacity first, but any candidate within 10% of the best usable capacity is acceptable; among those
+  # the secondary score decides (106 disks → 4×26 +2 spares, not 7×15 single-group vdevs).
+  local i best="" best_sec=999999
+  for i in "${!cand_w[@]}"; do
+    (( cand_data[i] * 100 >= max_data * 90 )) || continue
+    if (( cand_sec[i] < best_sec )); then
+      best=${cand_w[i]}
+      best_sec=${cand_sec[i]}
     fi
   done
-  echo "$total"
+  echo "$best"
 }
 
 assess_zpool_has_section() {
@@ -1137,13 +1365,16 @@ assess_print_special_feasibility() {
 }
 
 assess_print_create_option() {
-  local tag=$1 parity=$2 width=$3 ndisks=$4 vendor=$5 layout=$6 disk_b=$7 spec=$8 nvme_sz=$9
+  local tag=$1 parity=$2 width=$3 ndisks=$4 vendor=$5 layout=$6 disk_b=$7 spec=$8 nvme_sz=$9 hdd_spares=${10:-0}
   local nvdev usable spec_u ratio cmd extra
   nvdev=$((ndisks / width))
   usable=$(assess_draid_usable_bytes "$spec" "$disk_b" "$nvdev")
   ((++ASSESS_RANK))
   echo "[${ASSESS_RANK}] ${tag}"
   echo "    Data:     ${ndisks}× $(human_bytes "$disk_b") ${vendor}  →  ${nvdev} × ${spec}"
+  if (( hdd_spares > 0 )); then
+    echo "    HDD spare: ${hdd_spares}× leftover ${vendor} → pool hot spare(s)"
+  fi
   extra="    Aux:      2× NVMe SLOG mirror + 2× NVMe L2ARC"
   if [[ -n "$layout" ]]; then
     spec_u=$(assess_special_usable_bytes "$layout" "$nvme_sz")
@@ -1159,13 +1390,13 @@ assess_print_create_option() {
   fi
   echo "$extra"
   echo "    Usable:   ~$(human_bytes "$usable") data"
-  if [[ "$parity" != 3 ]]; then
-    echo "    Create:   POOL=${POOL} DRAID_PARITY=${parity} ${cmd}"
-    echo "    Dry-run:  POOL=${POOL} DRAID_PARITY=${parity} DRY_RUN=1 ${cmd}"
-  else
-    echo "    Create:   POOL=${POOL} ${cmd}"
-    echo "    Dry-run:  POOL=${POOL} DRY_RUN=1 ${cmd}"
-  fi
+  # Reproduce every non-default knob the layout above depends on, so the command is truly copy/paste.
+  local env="POOL=${POOL}"
+  [[ "$parity" != 3 ]] && env+=" DRAID_PARITY=${parity}"
+  [[ "$width" != 26 ]] && env+=" DISKS_PER_VDEV=${width}"
+  (( hdd_spares > 0 )) && env+=" HDD_SPARE_COUNT=${hdd_spares}"
+  echo "    Create:   ${env} ${cmd}"
+  echo "    Dry-run:  ${env} DRY_RUN=1 ${cmd}"
   echo
 }
 
@@ -1192,12 +1423,13 @@ run_storage_assessment() {
     small_n=0
     large_n=0
     special_fit=0
+    alias_maps=0
     declare -A grp_count=() grp_unused=() grp_vendor=() grp_product=() grp_size=()
     declare -A nvme_sz_unused=()
     echo "================ STORAGE SERVER ASSESSMENT ================"
     echo "Host:              $host"
     echo "Date:              $(date -Is 2>/dev/null || date)"
-    echo "Suggested pool:    $POOL"
+    echo "Suggested pool:    $POOL  (${POOL_NAME_SOURCE}; create mode asks you to verify)"
     echo "Script:            $SCRIPT_PATH"
     echo "Mode:              read-only (no mpathconf, no zpool create)"
     if command -v zfs >/dev/null 2>&1; then
@@ -1243,6 +1475,7 @@ run_storage_assessment() {
         [[ "$line" =~ ^[[:space:]] ]] && continue
         wwid=$(assess_extract_wwid "$line")
         [[ -n "$wwid" ]] || continue
+        mpath_header_is_alias "$line" && alias_maps=$((alias_maps + 1))
         vendor="UNKNOWN"
         product="UNKNOWN"
         if [[ "$line" =~ dm-[0-9]+[[:space:]]+([^,[:space:]]+),([^[:space:]]+) ]]; then
@@ -1270,6 +1503,15 @@ run_storage_assessment() {
       if ((${#mpath_rows[@]} == 0)); then
         echo "  (no multipath maps found)"
       else
+        if (( alias_maps > 0 )); then
+          echo "  Map naming:  mpathX aliases on ${alias_maps}/${#mpath_rows[@]} maps (user_friendly_names y)"
+          echo "               → create mode applies 'mpathconf --enable --user_friendly_names n' + multipath -r"
+          echo "                 so pool members are WWID-named (35000c500…), never mpathX."
+        else
+          echo "  Map naming:  WWID (user_friendly_names n) — as required for the pool"
+        fi
+        echo "  Member path: ${MPATH_DEV_DIR}/<WWID>   order: by dm-N (MPATH_SORT=dm)"
+        echo
         printf '  %-10s %-18s %10s %5s %6s  notes\n' "VENDOR" "PRODUCT" "SIZE" "TOTAL" "FREE"
         while IFS= read -r key; do
           [[ -z "$key" ]] && continue
@@ -1368,12 +1610,21 @@ run_storage_assessment() {
       (( ndisks >= 8 )) || continue
       vendor=${grp_vendor[$key]}
       disk_b=${grp_size[$key]}
+      navail=$ndisks
       width=$(assess_pick_width "$ndisks")
       if (( ndisks % width != 0 )); then
         ndisks=$((ndisks - ndisks % width))
       fi
       (( ndisks >= width && width >= 8 )) || continue
       have_hdd_option=1
+      hdd_spares=$((navail - ndisks))
+      # Alternative: the proven 26-wide layout when the best width differs and ≥26 disks exist.
+      alt_width=0
+      alt_ndisks=0
+      if (( width != 26 && navail >= 26 )); then
+        alt_width=26
+        alt_ndisks=$((navail - navail % 26))
+      fi
 
       best_layout=""
       for layout in "${layout_order[@]}"; do
@@ -1389,7 +1640,13 @@ run_storage_assessment() {
       if [[ -n "$spec" && -n "$best_layout" ]]; then
         assess_print_create_option \
           "RECOMMENDED — dRAID3 + special ${best_layout}" \
-          3 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}"
+          3 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
+        if (( alt_width > 0 )); then
+          alt_spec=$(compute_best_draid_spec "$alt_width" 3 balanced 2>/dev/null || true)
+          [[ -n "$alt_spec" ]] && assess_print_create_option \
+            "ALTERNATIVE — dRAID3 + special ${best_layout}, proven 26-wide vdevs" \
+            3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))"
+        fi
         for layout in "${layout_order[@]}"; do
           [[ "$layout" == "$best_layout" ]] && continue
           nvme_n=$(special_layout_nvme_total "$layout") || continue
@@ -1398,12 +1655,12 @@ run_storage_assessment() {
             raidz2x10 | raidz3x20 | raidz2-18+2spare)
               assess_print_create_option \
                 "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}"
+                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
               ;;
             *)
               assess_print_create_option \
                 "ALTERNATIVE — dRAID3 + special ${layout}" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}"
+                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
               ;;
           esac
         done
@@ -1416,7 +1673,7 @@ run_storage_assessment() {
       if [[ -n "$spec" && -n "$best_layout" ]]; then
         assess_print_create_option \
           "ALTERNATIVE — dRAID2 + special ${best_layout} (more capacity, less parity)" \
-          2 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}"
+          2 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
       fi
     done
 
@@ -1451,6 +1708,7 @@ run_storage_assessment() {
         (( ndisks >= 8 )) || continue
         vendor=${grp_vendor[$key]}
         disk_b=${grp_size[$key]}
+        navail=$ndisks
         width=$(assess_pick_width "$ndisks")
         if (( ndisks % width != 0 )); then
           ndisks=$((ndisks - ndisks % width))
@@ -1460,7 +1718,7 @@ run_storage_assessment() {
         [[ -n "$spec" ]] || continue
         assess_print_create_option \
           "LAST RESORT — dRAID3 WITHOUT special vdev (metadata on HDD)" \
-          3 "$width" "$ndisks" "$vendor" "" "$disk_b" "$spec" 0
+          3 "$width" "$ndisks" "$vendor" "" "$disk_b" "$spec" 0 "$((navail - ndisks))"
       done
     fi
 
@@ -1499,8 +1757,8 @@ run_storage_assessment() {
         add_n=$(special_layout_special_disk_count "$add_layout")
         spec_paths=()
         for ((i = 0; i < add_n && i < ${#nv_sorted[@]}; i++)); do
-          read -r row_sz row_path <<<"${nv_sorted[i]}"
-          spec_paths+=("$row_path")
+          read -r _ row_path <<<"${nv_sorted[i]}"
+          spec_paths+=("$(basename "$row_path")")
         done
         ((++ASSESS_RANK))
         enhanced=1
@@ -1544,6 +1802,8 @@ if [[ "$ASSESS_ONLY" == "1" ]]; then
   exit 0
 fi
 
+prompt_verify_pool_name
+
 # shellcheck disable=SC2086,SC2046
 apply_multipath_user_friendly_names_off
 
@@ -1552,24 +1812,67 @@ ALL_HDD_PATHS=()
 if [[ "$DATA_DISK_SOURCE" == nvme ]]; then
   discover_nvme_data_and_four_aux
 else
-  mapfile -t _WWIDS < <(collect_multipath_wwids_all | eval "$MPATH_SORT_CMD")
-  if (( ${#_WWIDS[@]} < TOTAL_DISKS )); then
-    echo "Error: multipath matched ${#_WWIDS[@]} disk(s) for pattern '${DISK_PATTERN}', need ${TOTAL_DISKS}." >&2
+  _alias_n=$(count_multipath_alias_maps)
+  if (( _alias_n > 0 )); then
+    if [[ "${MPATH_USER_FRIENDLY_NAMES:-0}" == "1" ]]; then
+      echo "Warning: ${_alias_n} multipath map(s) still use mpathX aliases (MPATH_USER_FRIENDLY_NAMES=1); pool members will be addressed by WWID via /dev/disk/by-id." >&2
+    else
+      echo "Error: ${_alias_n} multipath map(s) matching '${DISK_PATTERN}' still use mpathX aliases (user_friendly_names y)." >&2
+      echo "  The pool must be built on WWID-named maps (35000c500…). Fix and re-run:" >&2
+      echo "    mpathconf --enable --user_friendly_names n && systemctl restart multipathd && multipath -r" >&2
+      echo "  (if aliases persist: multipath -F && multipath -r, or reboot; check /etc/multipath/bindings)." >&2
+      echo "  DRY_RUN=1 does not change host config — run the commands above first, then dry-run again." >&2
+      exit 1
+    fi
+  fi
+  unset _alias_n
+
+  mapfile -t _WWIDS < <(collect_multipath_wwids_all)
+  _need_hdd=$((TOTAL_DISKS + HDD_SPARE_COUNT))
+  if (( ${#_WWIDS[@]} < _need_hdd )); then
+    echo "Error: multipath matched ${#_WWIDS[@]} disk(s) for pattern '${DISK_PATTERN}', need ${_need_hdd} (${TOTAL_DISKS} data + ${HDD_SPARE_COUNT} hot spare)." >&2
     exit 1
   fi
 
-  if (( ${#_WWIDS[@]} > TOTAL_DISKS )); then
-    echo "Note: using first ${TOTAL_DISKS} of ${#_WWIDS[@]} matched disks (sorted unique WWID)." >&2
-    _WWIDS=("${_WWIDS[@]:0:TOTAL_DISKS}")
+  if (( ${#_WWIDS[@]} > _need_hdd )); then
+    echo "Note: using first ${_need_hdd} of ${#_WWIDS[@]} matched disks (order: MPATH_SORT=${MPATH_SORT:-dm}); $(( ${#_WWIDS[@]} - _need_hdd )) left unused — consider HDD_SPARE_COUNT." >&2
   fi
 
   local_wwid=
-  for local_wwid in "${_WWIDS[@]}"; do
+  for local_wwid in "${_WWIDS[@]:0:TOTAL_DISKS}"; do
     ALL_HDD_PATHS+=("$(resolve_mpath_device "$local_wwid")")
   done
+  if (( HDD_SPARE_COUNT > 0 )); then
+    for local_wwid in "${_WWIDS[@]:TOTAL_DISKS:HDD_SPARE_COUNT}"; do
+      HDD_SPARES+=("$(resolve_mpath_device "$local_wwid")")
+    done
+  fi
+  unset _need_hdd
 
   discover_four_nvme_log_and_cache
 fi
+
+# --- Safety: refuse data disks that carry a filesystem, partition table, or ZFS label ---
+# zpool create would also refuse most of these without -f, but a clear list up front is better than a
+# half-parsed zpool error over 78 devices. ZPOOL_FORCE=1 turns this into a warning and adds -f.
+_in_use_list=()
+for _p in "${ALL_HDD_PATHS[@]}" ${HDD_SPARES[@]+"${HDD_SPARES[@]}"}; do
+  if ! _reason=$(device_in_use_reason "$_p"); then
+    _in_use_list+=("${_p}  [${_reason:-in-use}]")
+  fi
+done
+if ((${#_in_use_list[@]} > 0)); then
+  _label="Error"
+  [[ "$ZPOOL_FORCE" == "1" ]] && _label="Warning (ZPOOL_FORCE=1)"
+  echo "${_label}: ${#_in_use_list[@]} selected data disk(s) look in use:" >&2
+  printf '  %s\n' "${_in_use_list[@]}" >&2
+  if [[ "$ZPOOL_FORCE" != "1" ]]; then
+    echo "Wipe them deliberately (wipefs -a / zpool labelclear) or set ZPOOL_FORCE=1 to pass -f to zpool create." >&2
+    exit 1
+  fi
+  unset _label
+fi
+unset _in_use_list _p _reason
 
 # Split into vdevs of DISKS_PER_VDEV
 VDEV_DISKS_ARRAYS=()
@@ -1596,12 +1899,42 @@ else
   ONE_DRAID_SPEC=$(compute_best_draid_spec "$DISKS_PER_VDEV" "$DRAID_PARITY" "$DRAID_PROFILE") || exit 1
 fi
 
-_zpool_cmd=(zpool create "$POOL"
+# OpenZFS >= 2.1 is required for dRAID; warn (do not block) if the version string looks older.
+_zfsver=$(zfs version 2>/dev/null | head -n1 | sed -n 's/^zfs-\([0-9]*\.[0-9]*\).*/\1/p' || true)
+if [[ -n "$_zfsver" ]] && awk -v v="$_zfsver" 'BEGIN { exit (v + 0 < 2.1) ? 0 : 1 }'; then
+  echo "Warning: OpenZFS ${_zfsver} detected — dRAID needs 2.1 or newer; zpool create will likely fail." >&2
+fi
+unset _zfsver
+
+# Pool members are given to zpool as short names (ZPOOL_DEV_NAMES=short, default): the multipath WWID
+# (35000c500d84e2553) and the NVMe by-id name (nvme-MTFDLAL7T6THG-1BP1DFCYY_112611AE997D). OpenZFS resolves
+# bare names through /dev/disk/by-vdev, /dev/mapper, /dev/disk/by-id, … and shows them unchanged in
+# `zpool status`. ZPOOL_DEV_NAMES=full keeps absolute paths. Discovery/in-use checks always use full paths.
+vdev_name() {
+  if [[ "${ZPOOL_DEV_NAMES:-short}" == full ]]; then
+    printf '%s' "$1"
+  else
+    basename "$1"
+  fi
+}
+vdev_names() { local p; for p in "$@"; do vdev_name "$p"; done; }
+
+if [[ "${ZPOOL_DEV_NAMES:-short}" != short && "${ZPOOL_DEV_NAMES:-short}" != full ]]; then
+  echo "Error: ZPOOL_DEV_NAMES must be 'short' or 'full' (got '${ZPOOL_DEV_NAMES}')." >&2
+  exit 1
+fi
+
+_zpool_cmd=(zpool create)
+[[ "$ZPOOL_FORCE" == "1" ]] && _zpool_cmd+=(-f)
+_zpool_cmd+=("$POOL"
   -o ashift=12
   -o autoexpand=on
   -o autoreplace=on
+  -o autotrim=on
   -O acltype=posixacl
   -O xattr=sa
+  -O dnodesize=auto
+  -O "atime=${ZFS_ATIME}"
   -O compression=lz4
   -O dedup=off
 )
@@ -1614,28 +1947,47 @@ for local_vdev_idx in "${!VDEV_DISKS_ARRAYS[@]}"; do
     echo "Error: vdev $((local_vdev_idx + 1)) has ${#local_vdev_paths[@]} disks, expected ${DISKS_PER_VDEV}." >&2
     exit 1
   fi
-  _zpool_cmd+=("$ONE_DRAID_SPEC" "${local_vdev_paths[@]}")
+  mapfile -t local_vdev_names < <(vdev_names "${local_vdev_paths[@]}")
+  _zpool_cmd+=("$ONE_DRAID_SPEC" "${local_vdev_names[@]}")
 done
 
-_zpool_cmd+=(log mirror "${NVME_LOG[@]}")
-_zpool_cmd+=(cache "${NVME_CACHE[@]}")
+if ((${#NVME_LOG[@]} > 0)); then
+  mapfile -t _names < <(vdev_names "${NVME_LOG[@]}")
+  _zpool_cmd+=(log mirror "${_names[@]}")
+fi
+if ((${#NVME_CACHE[@]} > 0)); then
+  mapfile -t _names < <(vdev_names "${NVME_CACHE[@]}")
+  _zpool_cmd+=(cache "${_names[@]}")
+fi
 
 if (( SPECIAL_ENABLED )); then
-  append_special_vdev_to_zpool_cmd "$SPECIAL_LAYOUT" "${NVME_SPECIAL[@]}" || exit 1
+  mapfile -t _names < <(vdev_names "${NVME_SPECIAL[@]}")
+  append_special_vdev_to_zpool_cmd "$SPECIAL_LAYOUT" "${_names[@]}" || exit 1
 fi
-if ((${#NVME_POOL_SPARE[@]} > 0)); then
-  _zpool_cmd+=(spare "${NVME_POOL_SPARE[@]}")
+if ((${#HDD_SPARES[@]} + ${#NVME_POOL_SPARE[@]} > 0)); then
+  mapfile -t _names < <(vdev_names ${HDD_SPARES[@]+"${HDD_SPARES[@]}"} ${NVME_POOL_SPARE[@]+"${NVME_POOL_SPARE[@]}"})
+  _zpool_cmd+=(spare "${_names[@]}")
 fi
+unset _names
 
-POOL_SETUP_LOG="${POOL_SETUP_LOG:-/tmp/zfs-orcd-${POOL}-$(date +%Y%m%d-%H%M%S).log}"
+# Log: /var/log/zfs-orcd (survives reboots) when writable, else /tmp.
+if [[ -z "${POOL_SETUP_LOG:-}" ]]; then
+  _stamp=$(date +%Y%m%d-%H%M%S)
+  if mkdir -p /var/log/zfs-orcd 2>/dev/null && [[ -w /var/log/zfs-orcd ]]; then
+    POOL_SETUP_LOG="/var/log/zfs-orcd/zfs-orcd-${POOL}-${_stamp}.log"
+  else
+    POOL_SETUP_LOG="/tmp/zfs-orcd-${POOL}-${_stamp}.log"
+  fi
+  unset _stamp
+fi
 if ! : >"$POOL_SETUP_LOG" 2>/dev/null; then
   POOL_SETUP_LOG="/tmp/zfs-orcd-${POOL}-pool.log"
   : >"$POOL_SETUP_LOG" || {
-    echo "Error: cannot write log under /tmp." >&2
+    echo "Error: cannot write log file (${POOL_SETUP_LOG})." >&2
     exit 1
   }
 fi
-write_pool_setup_log_preamble "$POOL_SETUP_LOG" "$0" "$@"
+write_pool_setup_log_preamble "$POOL_SETUP_LOG" "$0" ${ORIG_ARGV[@]+"${ORIG_ARGV[@]}"}
 
 print_visual_pool_layout
 echo
@@ -1664,7 +2016,13 @@ prompt_confirm_zpool_create
   echo "=== zpool create stdout/stderr: $(date -Is 2>/dev/null || date) ==="
 } >>"$POOL_SETUP_LOG"
 
-echo "Creating pool $POOL with ${ONE_DRAID_SPEC} + log + cache${SPECIAL_ENABLED:+ + special ${SPECIAL_LAYOUT}}${NVME_POOL_SPARE[0]:+ + ${#NVME_POOL_SPARE[@]} hot spare(s)} + optimization flags..."
+_desc="${NUM_VDEVS} × ${ONE_DRAID_SPEC}"
+((${#NVME_LOG[@]} > 0)) && _desc+=" + log mirror"
+((${#NVME_CACHE[@]} > 0)) && _desc+=" + cache"
+(( SPECIAL_ENABLED )) && _desc+=" + special ${SPECIAL_LAYOUT}"
+((${#HDD_SPARES[@]} + ${#NVME_POOL_SPARE[@]} > 0)) && _desc+=" + $(( ${#HDD_SPARES[@]} + ${#NVME_POOL_SPARE[@]} )) hot spare(s)"
+echo "Creating pool $POOL: ${_desc} + optimization flags..."
+unset _desc
 
 if "${_zpool_cmd[@]}" 2>&1 | tee -a "$POOL_SETUP_LOG"; then
   echo "------------------------------------------------"
@@ -1686,7 +2044,7 @@ fi
 } >>"$POOL_SETUP_LOG"
 
 _orcd_key="/etc/zfs/keys/${POOL}.key"
-_orcd_dest="hstor001:/data2/backup/systems/001/$(hostname)/"
+_orcd_dest="${ORCD_BACKUP_DEST-hstor001:/data2/backup/systems/001/$(hostname)/}"
 if [[ -f "$_orcd_key" ]]; then
   zfs create -o encryption=aes-256-gcm -o "keylocation=file://${_orcd_key}" -o keyformat=hex "${POOL}/orcd" 2>&1 | tee -a "$POOL_SETUP_LOG" || echo "Warning: encrypted ${POOL}/orcd create failed." | tee -a "$POOL_SETUP_LOG"
   zfs set quota=20T "${POOL}/orcd" 2>&1 | tee -a "$POOL_SETUP_LOG" || true
@@ -1699,7 +2057,9 @@ zfs list 2>&1 | tee -a "$POOL_SETUP_LOG" || true
 
 systemctl enable "zfs-scrub-monthly@${POOL}.timer" --now 2>&1 | tee -a "$POOL_SETUP_LOG" || echo "Warning: could not enable zfs-scrub-monthly@${POOL}.timer" | tee -a "$POOL_SETUP_LOG"
 
-if command -v rsync >/dev/null 2>&1; then
+if [[ -z "$_orcd_dest" ]]; then
+  echo "ORCD_BACKUP_DEST is empty — skipping rsync of script/key." | tee -a "$POOL_SETUP_LOG"
+elif command -v rsync >/dev/null 2>&1; then
   if [[ -f "/root/${POOL}.sh" ]]; then
     rsync -av "/root/${POOL}.sh" "$_orcd_dest" 2>&1 | tee -a "$POOL_SETUP_LOG" || echo "Warning: rsync of /root/${POOL}.sh failed." | tee -a "$POOL_SETUP_LOG"
   elif [[ -f "$SCRIPT_PATH" ]]; then
