@@ -7,7 +7,7 @@ Utility for HPC-style environments to set **per-group inode (object) quotas** on
 
 The implementation lives in [`zfs-set-group-quota.sh`](zfs-set-group-quota.sh).
 
-This repository also holds the ORCD storage-server tooling: [shared pool provisioning](#shared-pool-provisioning) (`zfs-make-share-pool.sh`) and [new-server dRAID pool creation with a special vdev](#new-storage-server-draid-pool-with-a-special-vdev) (`zfs-draid.sh`).
+This repository also holds the ORCD storage-server tooling: [shared pool provisioning](#shared-pool-provisioning) (`zfs-make-share-pool.sh`), [new-server dRAID pool creation with a special vdev](#new-storage-server-draid-pool-with-a-special-vdev) (`zfs-draid.sh`), and [seeding a new pool for lab tests](#seed-a-new-pool-for-lab-tests) (`zfs-blockclone.sh`).
 
 ---
 
@@ -373,6 +373,69 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 ### Adding a special vdev to an existing pool
 
 If a pool already exists without a special vdev and ≥10 NVMe are unused, the assessment prints a ready `zpool add <pool> special mirror …` line. Preview with `zpool add -n` first. Remember that **losing an entire special vdev loses the pool** — always use mirrors in production.
+
+---
+
+## Seed a new pool for lab tests
+
+[`zfs-blockclone.sh`](zfs-blockclone.sh) copies a dataset onto a newly provisioned pool (after [`zfs-draid.sh`](zfs-draid.sh)) so you can time NFS/client I/O, **scrub**, and **resilver**. It also has optional same-pool **block cloning** (OpenZFS BRT / `copy_file_range`) to make extra working copies without rewriting payload blocks.
+
+Block cloning cannot copy between servers or between pools. Migration is `zfs send | zfs recv` or an NFS `rsync`. Both write **unique** blocks on the new pool — that is the seed you want for scrub/resilver. `clone-tree` afterwards **shares** those blocks (`USED` stays small) and does **not** add resilver work; use `copy-tree` for a second unique copy that fills capacity.
+
+### Where to run it
+
+Copy the script to the **new** storage host and run it there as root:
+
+```bash
+scp zfs-blockclone.sh hstor0NN-n1:/root/
+ssh hstor0NN-n1
+cd /root && chmod +x zfs-blockclone.sh
+./zfs-blockclone.sh check --pool data1
+```
+
+### Seed without SSH (NFS already mounted)
+
+If the old dataset is NFS-mounted on the new server:
+
+```bash
+./zfs-blockclone.sh seed --mode rsync --src /mnt/old/proj --dst data1/lab/gold/proj
+```
+
+### Seed with zfs send (faster, preserves properties)
+
+**Pull** (run on NEW) needs passwordless SSH **NEW → OLD**, not the other way around:
+
+```bash
+# on NEW as root, once
+[[ -f /root/.ssh/id_ed25519 ]] || ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519
+ssh-copy-id -i /root/.ssh/id_ed25519.pub root@OLD
+ssh -o BatchMode=yes root@OLD 'hostname; zfs list -H -o name | head'
+
+./zfs-blockclone.sh check --pool data1 --ssh root@OLD
+./zfs-blockclone.sh seed --src root@OLD:data1/proj --dst data1/lab/gold/proj
+```
+
+**Push** (run on OLD) needs SSH **OLD → NEW**:
+
+```bash
+./zfs-blockclone.sh seed --src data1/proj --dst root@NEW:data1/lab/gold/proj
+```
+
+Full SSH notes: `./zfs-blockclone.sh ssh-help`.
+
+### Scrub / resilver vs extra namespaces
+
+```bash
+# unique working copy (USED ≈ REFER) — scrub/resilver load
+./zfs-blockclone.sh prep-dst data1/lab/work/proj --like data1/lab/gold/proj
+./zfs-blockclone.sh copy-tree data1/lab/gold/proj data1/lab/work/proj
+
+# cheap extra namespace (USED << REFER) — not extra unique data
+./zfs-blockclone.sh clone-tree data1/lab/gold/proj data1/lab/clone/proj
+
+./zfs-blockclone.sh verify data1/lab/gold/proj data1/lab/work/proj --sample 50
+./zfs-blockclone.sh stats data1
+```
 
 ---
 
