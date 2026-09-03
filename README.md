@@ -317,6 +317,12 @@ Not every NVMe needs to go into the special vdev: metadata for a ~1.3 PiB pool i
 
 If a pool with the chosen name already exists (imported, or exported but still labelled), create mode shows its `zpool status` / `zfs list`, warns that **all data on it will be deleted**, and asks twice — a `y/N` question, then typing the pool name exactly. On confirmation it runs `zpool destroy -f`, then `zpool labelclear -f` and `wipefs -a` on every former member device (HDDs, NVMe special/log/cache/spares), disables the pool's scrub timer, logs everything to `/var/log/zfs-orcd/zfs-orcd-<pool>-destroy-<ts>.log`, and continues straight into the new create. Any other answer keeps the pool and exits. `DRY_RUN=1` never destroys anything: it reports the existing pool, treats its members as free so the dry run can show the new layout, and reminds you a real run will ask. For automation, `DESTROY_EXISTING=1 SKIP_CONFIRM=1` destroys without prompting.
 
+**NVMe are discarded, not just unlabelled.** `zpool labelclear` and `wipefs` only erase the ZFS labels and signatures; the flash still holds every block the old pool wrote (visible as `Usage` in `nvme list`, e.g. ~300 GB per former special-vdev member). The script therefore runs `blkdiscard` (whole-device TRIM) on every former SSD member after a destroy and on every NVMe member right before `zpool create` (`DISCARD_NVME=1`, default), so a new pool always starts on clean flash. HDDs have no discard support and are skipped. To clean up NVMe left behind by an earlier destroy, run the standalone mode, which lists every unused NVMe (never a partitioned/mounted/labelled one), asks `y/N` and then for the word `WIPE`, and shows `nvme list` before and after:
+
+```bash
+./zfs-draid.sh --wipe-nvme
+```
+
 ```bash
 # test cycle: dRAID3 9d:26c:2s + 3-way-mirror special, then destroy and rebuild
 POOL=data1 HDD_SPARE_COUNT=2 ./zfs-draid.sh --special=mirror3x6+2spare SEAGATE 104
@@ -345,6 +351,7 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 | `SPECIAL_NVME_COUNT=N`, `SPECIAL_MIRROR_WAY=2\|3` | Size/width of the default special layout (10 / 2). |
 | `SLOG=Y\|N`, `CACHE=Y\|N` | SLOG mirror / L2ARC on the smallest NVMe (defaults Y; `CACHE=N` common). |
 | `DESTROY_EXISTING=1` | With `SKIP_CONFIRM=1`: destroy an existing same-name pool without prompting. |
+| `--wipe-nvme`, `DISCARD_NVME=1\|0` | Standalone TRIM of all unused NVMe; whether create/destroy discard NVMe members (default 1). |
 | `DATA_DISK_SOURCE=mpath\|nvme` | Multipath HDDs (default) or all-flash NVMe data disks (no special vdev in that mode). |
 | `DRAID_PARITY=2\|3` | dRAID parity (default 3). |
 | `DRAID_PROFILE=balanced\|capacity` | Layout scoring; `capacity` maximises data disks with one wide group. |

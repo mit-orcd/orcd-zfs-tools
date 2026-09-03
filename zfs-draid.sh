@@ -55,6 +55,9 @@
 #   SPECIAL_NVME_COUNT  NVMe used by the default special layout (default 10); the rest stay free.
 #   SPECIAL_MIRROR_WAY  2 (default) or 3 — mirror width for the default layout.
 #   SLOG=Y|N  CACHE=Y|N  SLOG mirror (2 smallest NVMe) / L2ARC (next 2). Defaults Y; CACHE=N is common.
+#   DISCARD_NVME=1   (default) blkdiscard every NVMe member right before zpool create, and every former SSD
+#                    member after a destroy — labelclear/wipefs leave the old data blocks on the flash.
+#                    --wipe-nvme discards all currently unused NVMe as a standalone step (asks twice).
 #   DESTROY_EXISTING=1  With SKIP_CONFIRM=1, destroy an existing same-name pool without prompting.
 #                    Interactive runs always show the pool and ask twice (y/N, then type the pool name).
 #   SPECIAL_VDEV     Same as SPECIAL when set to a layout name; overrides SPECIAL=Y default.
@@ -97,6 +100,8 @@ CACHE="${CACHE:-Y}"
 SPECIAL_NVME_COUNT="${SPECIAL_NVME_COUNT:-10}"
 SPECIAL_MIRROR_WAY="${SPECIAL_MIRROR_WAY:-2}"
 DESTROY_EXISTING="${DESTROY_EXISTING:-0}"
+DISCARD_NVME="${DISCARD_NVME:-1}"
+WIPE_NVME_MODE=0
 ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
 HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
 ZFS_ARC_TUNE="${ZFS_ARC_TUNE:-1}"
@@ -213,6 +218,120 @@ pool_member_devices() {
   zpool status -P "$1" 2>/dev/null | awk '$1 ~ /^\/dev\// {print $1}'
 }
 
+# --- SSD cleanup: whole-device discard (TRIM) ---
+# labelclear/wipefs only erase ZFS labels and signatures; the drive still holds every written block
+# (visible as "Usage" in `nvme list`). blkdiscard deallocates the whole device — the real "prepare for a
+# new pool" step for NVMe. Devices without discard support (SAS HDDs) are skipped. Refuses in-use devices.
+device_supports_discard() {
+  local dev=$1 dm real
+  dm=$(lsblk -dn -o DISC-MAX "$dev" 2>/dev/null | tr -d ' ' || true)
+  [[ -n "$dm" && "$dm" != 0B && "$dm" != 0 ]] && return 0
+  real=$(readlink -f "$dev" 2>/dev/null || true)
+  [[ -n "$real" && -r "/sys/block/$(basename "$real")/queue/discard_max_bytes" ]] &&
+    (( $(cat "/sys/block/$(basename "$real")/queue/discard_max_bytes" 2>/dev/null || echo 0) > 0 ))
+}
+
+discard_device() { # $1 dev, $2 logfile → 0 discarded, 1 skipped
+  local dev=$1 logf=${2:-/dev/null} reason
+  [[ -b "$dev" ]] || return 1
+  if ! reason=$(device_in_use_reason "$dev"); then
+    echo "  skip ${dev}: in use (${reason})" | tee -a "$logf" >&2
+    return 1
+  fi
+  if ! device_supports_discard "$dev"; then
+    echo "  skip ${dev}: no discard support (HDD)" | tee -a "$logf"
+    return 1
+  fi
+  if ! command -v blkdiscard >/dev/null 2>&1; then
+    echo "  skip ${dev}: blkdiscard not installed (util-linux)" | tee -a "$logf" >&2
+    return 1
+  fi
+  if blkdiscard -f "$dev" >>"$logf" 2>&1 || blkdiscard "$dev" >>"$logf" 2>&1; then
+    echo "  discarded ${dev}" | tee -a "$logf"
+    return 0
+  fi
+  echo "  Warning: blkdiscard failed on ${dev} (see log)" | tee -a "$logf" >&2
+  return 1
+}
+
+# Discard the NVMe members chosen for the new pool right before zpool create (DISCARD_NVME=1, default).
+discard_new_pool_nvme() {
+  local -a devs=()
+  local d n=0
+  [[ "$DISCARD_NVME" == "1" ]] || { echo "DISCARD_NVME=${DISCARD_NVME} — not discarding NVMe members before create."; return 0; }
+  devs=(${NVME_LOG[@]+"${NVME_LOG[@]}"} ${NVME_CACHE[@]+"${NVME_CACHE[@]}"} ${NVME_SPECIAL[@]+"${NVME_SPECIAL[@]}"} ${NVME_POOL_SPARE[@]+"${NVME_POOL_SPARE[@]}"})
+  if [[ "$DATA_DISK_SOURCE" == nvme ]]; then
+    devs+=("${ALL_HDD_PATHS[@]}")
+  fi
+  ((${#devs[@]} > 0)) || return 0
+  echo "Discarding (TRIM) ${#devs[@]} NVMe member(s) so the new pool starts on clean flash…"
+  for d in "${devs[@]}"; do
+    discard_device "$d" "$POOL_SETUP_LOG" && n=$((n + 1))
+  done
+  echo "Discarded ${n}/${#devs[@]} NVMe device(s)."
+  if command -v udevadm >/dev/null 2>&1; then udevadm settle 2>/dev/null || true; fi
+}
+
+# --wipe-nvme: standalone cleanup of every unused NVMe (no labels, not mounted, no partitions).
+run_wipe_unused_nvme() {
+  local -a devs=() skipped=()
+  local f reason r sz logf ts n=0
+  ts=$(date +%Y%m%d-%H%M%S)
+  mkdir -p /var/log/zfs-orcd 2>/dev/null || true
+  logf="/var/log/zfs-orcd/zfs-orcd-wipe-nvme-${ts}.log"
+  : >"$logf" 2>/dev/null || logf="/tmp/zfs-orcd-wipe-nvme-${ts}.log"
+  echo "================ WIPE UNUSED NVMe (blkdiscard) ================"
+  echo "Host: $(hostname)   Log: ${logf}"
+  echo
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if reason=$(device_in_use_reason "$f"); then
+      sz=$(blockdev --getsize64 "$f" 2>/dev/null || echo 0)
+      devs+=("$f")
+      printf '  %-60s %10s  unused → will be discarded\n' "$(basename "$f")" "$(human_bytes "$sz")"
+    else
+      skipped+=("$f [$reason]")
+    fi
+  done < <(pick_all_nvme_by_id_paths | sort)
+  if ((${#skipped[@]} > 0)); then
+    echo
+    echo "  Kept (in use, NOT touched):"
+    printf '    %s\n' "${skipped[@]}"
+  fi
+  echo
+  if ((${#devs[@]} == 0)); then
+    echo "No unused NVMe found — nothing to do."
+    return 0
+  fi
+  if command -v nvme >/dev/null 2>&1; then
+    echo "--- nvme list before ---"
+    nvme list 2>/dev/null | awk 'NR <= 2 || /nvme/' || true
+    echo
+  fi
+  if [[ "${SKIP_CONFIRM:-0}" != "1" ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "Error: stdin is not a terminal; set SKIP_CONFIRM=1 to wipe without prompting." >&2
+      exit 1
+    fi
+    echo "!!! blkdiscard ERASES ALL DATA on the ${#devs[@]} device(s) listed as unused above. !!!"
+    read -r -p "Discard these ${#devs[@]} NVMe device(s)? [y/N] " r || true
+    case "${r,,}" in y | yes) ;; *) echo "Aborted — nothing discarded." >&2; exit 2 ;; esac
+    read -r -p "Second confirmation — type WIPE to proceed: " r || true
+    [[ "$r" == WIPE ]] || { echo "Confirmation did not match — nothing discarded." >&2; exit 2; }
+  fi
+  echo "=== wipe unused NVMe — $(date -Is 2>/dev/null || date) ===" >>"$logf"
+  for f in "${devs[@]}"; do
+    discard_device "$f" "$logf" && n=$((n + 1))
+  done
+  if command -v udevadm >/dev/null 2>&1; then udevadm settle 2>/dev/null || true; fi
+  echo
+  echo "Discarded ${n}/${#devs[@]} NVMe device(s). Log: ${logf}"
+  if command -v nvme >/dev/null 2>&1; then
+    echo "--- nvme list after ---"
+    nvme list 2>/dev/null | awk 'NR <= 2 || /nvme/' || true
+  fi
+}
+
 destroy_existing_pool() { # $1 pool (already imported)
   local pool=$1 dev logf ts
   local -a members=()
@@ -233,6 +352,7 @@ destroy_existing_pool() { # $1 pool (already imported)
     exit 1
   fi
   echo "--- labelclear / wipefs on former members ---" >>"$logf"
+  local ndisc=0 nleft=0
   for dev in ${members[@]+"${members[@]}"}; do
     [[ -b "$dev" ]] || continue
     zpool labelclear -f "$dev" >>"$logf" 2>&1 || true
@@ -240,7 +360,24 @@ destroy_existing_pool() { # $1 pool (already imported)
       wipefs -a "$dev" >>"$logf" 2>&1 || true
     fi
     echo "  cleared ${dev}" | tee -a "$logf"
+    # Verify no ZFS label survived (zdb -l fails on a clean device).
+    if command -v zdb >/dev/null 2>&1 && zdb -l "$dev" >/dev/null 2>&1; then
+      echo "  Warning: ${dev} still carries a ZFS label after labelclear/wipefs — inspect with 'zdb -l ${dev}'." | tee -a "$logf" >&2
+      nleft=$((nleft + 1))
+    fi
   done
+  if [[ "$DISCARD_NVME" == "1" ]]; then
+    echo "--- blkdiscard (TRIM) on former SSD members ---" | tee -a "$logf"
+    for dev in ${members[@]+"${members[@]}"}; do
+      [[ -b "$dev" ]] || continue
+      device_supports_discard "$dev" || continue
+      discard_device "$dev" "$logf" && ndisc=$((ndisc + 1))
+    done
+    echo "  ${ndisc} SSD(s) discarded (HDDs skipped — no discard support)." | tee -a "$logf"
+  else
+    echo "DISCARD_NVME=${DISCARD_NVME} — former NVMe members were NOT discarded (old data blocks remain; run --wipe-nvme later)." | tee -a "$logf"
+  fi
+  (( nleft == 0 )) || echo "Warning: ${nleft} device(s) still show a ZFS label; zpool create will refuse them unless cleaned." | tee -a "$logf" >&2
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "zfs-scrub-monthly@${pool}.timer" >>"$logf" 2>&1 || true
   fi
@@ -370,6 +507,7 @@ usage() {
   echo "  -h, --help              Show this help"
   echo "      --help-special      Show special vdev layout choices"
   echo "  -A, --assess            Force assessment report (also the default when no pattern is given)"
+  echo "      --wipe-nvme         Discard (TRIM) every unused NVMe so it is clean for a new pool (asks twice)"
   echo "  -S, --special[=layout]  Enable special vdev (default: SPECIAL_NVME_COUNT=${SPECIAL_NVME_COUNT} NVMe as ${SPECIAL_MIRROR_WAY}-way mirrors)"
   echo
   echo "  disk_vendor_pattern  Case-insensitive substring matched against:"
@@ -529,6 +667,10 @@ parse_cli_args() {
         ;;
       -A | --assess)
         ASSESS_ONLY=1
+        shift
+        ;;
+      --wipe-nvme)
+        WIPE_NVME_MODE=1
         shift
         ;;
       --special)
@@ -2143,6 +2285,16 @@ run_storage_assessment() {
   echo "Assessment log: $logf"
 }
 
+# --- Standalone NVMe wipe mode ---
+if (( WIPE_NVME_MODE )); then
+  if (( EUID != 0 )); then
+    echo "Error: --wipe-nvme must run as root." >&2
+    exit 1
+  fi
+  run_wipe_unused_nvme
+  exit 0
+fi
+
 # --- Build HDD list ---
 if [[ "$ASSESS_ONLY" == "1" ]]; then
   run_storage_assessment
@@ -2374,6 +2526,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 prompt_confirm_zpool_create
+
+discard_new_pool_nvme 2>&1 | tee -a "$POOL_SETUP_LOG"
 
 {
   echo "Confirmed: zpool create will run at $(date -Is 2>/dev/null || date)"
