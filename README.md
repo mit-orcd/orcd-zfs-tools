@@ -7,7 +7,7 @@ Utility for HPC-style environments to set **per-group inode (object) quotas** on
 
 The implementation lives in [`zfs-set-group-quota.sh`](zfs-set-group-quota.sh).
 
-This repository also holds the ORCD storage-server tooling: [shared pool provisioning](#shared-pool-provisioning) (`zfs-make-share-pool.sh`), [new-server dRAID pool creation with a special vdev](#new-storage-server-draid-pool-with-a-special-vdev) (`zfs-draid.sh`), and [seeding a new pool for lab tests](#seed-a-new-pool-for-lab-tests) (`zfs-blockclone.sh`).
+This repository also holds the ORCD storage-server tooling: [shared pool provisioning](#shared-pool-provisioning) (`zfs-make-share-pool.sh`), [new-server pool creation with a special vdev](#new-storage-server-zfs-pool-with-a-special-vdev) (`zfs-pool-setup.sh`; `zfs-draid.sh` is a symlink), and [seeding a new pool for lab tests](#seed-a-new-pool-for-lab-tests) (`zfs-blockclone.sh`).
 
 ---
 
@@ -188,23 +188,23 @@ This provisions dataset `<pool>/<PiKerbName>_shared` with group `orcd_rg_shared_
 
 ---
 
-## New storage server: dRAID pool with a special vdev
+## New storage server: ZFS pool with a special vdev
 
-[`zfs-draid.sh`](zfs-draid.sh) is run **on a new ZFS storage server** (RHEL, OpenZFS ≥ 2.1, `device-mapper-multipath`). It has two modes:
+[`zfs-pool-setup.sh`](zfs-pool-setup.sh) is run **on a new ZFS storage server** (RHEL, OpenZFS ≥ 2.1 for dRAID, `device-mapper-multipath`). [`zfs-draid.sh`](zfs-draid.sh) is a compatibility symlink to the same script (create default remains dRAID). Two modes:
 
 1. **Assessment** (no arguments) — read-only. Inventories multipath HDDs and NVMe, checks which special-vdev layouts fit, and prints ranked, copy/paste deployment commands. It never changes host configuration.
-2. **Create** (`<vendor_pattern> [total_hdd_count]`) — builds the `zpool create` command, shows the full layout, asks for confirmation, creates the pool, then applies the ORCD follow-ups (encrypted `<pool>/orcd` dataset if a key exists, monthly scrub timer, backup of script + key).
+2. **Create** (`[--raidz3|--raidz2|--draid] <vendor_pattern> [total_hdd_count]`) — builds the `zpool create` command, shows the full layout, asks for confirmation, creates the pool, then applies the ORCD follow-ups (encrypted `<pool>/orcd` dataset if a key exists, monthly scrub timer, backup of script + key).
 
-The priority is a **dRAID data pool with a mirrored NVMe special vdev** (metadata / small blocks). Without it metadata lives on HDD and directory-heavy HPC workloads suffer.
+The priority is **raidz3, then raidz2, then dRAID**, each **with a mirrored NVMe special vdev** (metadata / small blocks) when unused NVMe exist. Without a special vdev, metadata lives on HDD and directory-heavy HPC workloads suffer. 78 HDDs → `6 × raidz3` of 13 (classic) or `3 × draid3` of 26.
 
 ### Where to run it
 
 Copy the script to the storage host and run it there **as root** (device sizes, `blkid` probing and `multipath` queries need root):
 
 ```bash
-scp zfs-draid.sh hstor0NN-n1:/root/
+scp zfs-pool-setup.sh hstor0NN-n1:/root/
 ssh hstor0NN-n1
-cd /root && chmod +x zfs-draid.sh
+cd /root && chmod +x zfs-pool-setup.sh
 ```
 
 The pool name is derived from the hostname: a name ending in `n1-mgmt` → `data1`, `n2-mgmt` → `data2` (e.g. `hstor004-n1-mgmt` → `data1`); **any other hostname → `data1`**. Set `POOL=` to override. Create and dry-run runs **always ask you to verify the name** before touching anything:
@@ -219,23 +219,27 @@ Enter keeps it, typing a name replaces it (validated as a legal pool name). If a
 ### Step 1 — assess
 
 ```bash
-./zfs-draid.sh            # or: ./zfs-draid.sh --assess
+./zfs-pool-setup.sh            # or: ./zfs-draid.sh --assess
 ```
 
-The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing pools, an HDD table (vendor / product / size / total / free), NVMe split into *unused* and *in use*, which special layouts fit, and a ranked list such as:
+The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing pools, an HDD table (vendor / product / size / total / free), NVMe split into *unused* and *in use*, which special layouts fit, and a ranked list. **raidz3 and raidz2 with a special vdev are first**; dRAID follows as an alternative. Example:
 
 ```text
-[1] RECOMMENDED — dRAID3 + special mirror10
-    Data:     78× 18.19 TiB SEAGATE  →  3 × draid3:9d:26c:2s
+--- raidz3 (78 data disks → 6 × raidz3 of 13; leftover 0 spare) ---
+[1] RECOMMENDED — raidz3 + special mirror5 (10 NVMe, 2-way mirrors) + L2ARC
+    Data:     78× 18.19 TiB SEAGATE  →  6 × raidz3 of 13  (3 parity, 10 data per vdev)
     Aux:      2× NVMe SLOG mirror + 2× NVMe L2ARC
-    Special:  mirror10 — 10× mirror (20 NVMe)  (69.86 TiB usable)
-    Usable:   ~982 TiB data
-    Create:   POOL=data1 ./zfs-draid.sh --special=mirror10 SEAGATE 78
-    Dry-run:  POOL=data1 DRY_RUN=1 ./zfs-draid.sh --special=mirror10 SEAGATE 78
+    Special:  mirror5 — 5× mirror pair (10 NVMe)
+    Create:   POOL=data1 ./zfs-pool-setup.sh --raidz3 --special=mirror5 SEAGATE 78
+    Dry-run:  POOL=data1 DRY_RUN=1 ./zfs-pool-setup.sh --raidz3 --special=mirror5 SEAGATE 78
 
-[2] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x6+2spare
-    Special:  6× 3-way mirror (18 NVMe) + 2 pool hot spares  (41.92 TiB usable)
-    Create:   POOL=data1 ./zfs-draid.sh --special=mirror3x6+2spare SEAGATE 78
+--- raidz2 ---
+[n] RECOMMENDED — raidz2 + special mirror5 …
+
+--- dRAID (distributed parity; sequential rebuild) ---
+[n] ALTERNATIVE — dRAID3 + special mirror5 …
+    Data:     78× 18.19 TiB SEAGATE  →  3 × draid3:9d:26c:2s
+    Create:   POOL=data1 ./zfs-pool-setup.sh --special=mirror5 SEAGATE 78
 ```
 
 A disk counts as *unused* only if it has no filesystem, no partition table, no ZFS label, no mount and no LVM/md/LUKS holder — so the OS NVMe is never offered as SLOG/special.
@@ -249,7 +253,7 @@ Paste the `Dry-run:` line. It performs the full discovery, prints every device p
 Drop `DRY_RUN=1`:
 
 ```bash
-POOL=data1 ./zfs-draid.sh --special=mirror10 SEAGATE 78
+POOL=data1 ./zfs-pool-setup.sh --raidz3 --special=mirror5 SEAGATE 78
 ```
 
 The script applies `mpathconf --enable --user_friendly_names n`, restarts `multipathd` and reloads the maps (`multipath -r`) so every map is WWID-named (skip with `SKIP_MPATH_MPATHCONF=1`), refuses to continue if any selected data disk looks in use (list is printed; `ZPOOL_FORCE=1` overrides and adds `-f`), shows the layout, and asks `Confirm to run this zpool create? [y/N]` (`SKIP_CONFIRM=1` for automation). The full session log lands in `/var/log/zfs-orcd/` (falls back to `/tmp`).
@@ -284,7 +288,7 @@ The assessment report shows the current naming mode (`Map naming: WWID` or `mpat
 | Special | Largest unused NVMe after log/cache. **Default: `SPECIAL_NVME_COUNT=10` NVMe** as `SPECIAL_MIRROR_WAY=2`-way mirrors → `mirror5`; the other NVMe stay free for a later `zpool add`. Generic layout syntax for `--special=`: `mirror<G>` (G pairs), `mirror3x<G>` (G **3-way** mirrors), optional `+<S>spare` — e.g. `mirror3x3+1spare` (10 NVMe, extra redundancy), `mirror10` / `mirror3x6+2spare` (all 20). Raidz variants exist but are not recommended. `SPECIAL_PATTERN=7600` restricts to one model. |
 | Pool props | `ashift=12 autoexpand=on autoreplace=on autotrim=on`, `acltype=posixacl xattr=sa dnodesize=auto atime=off compression=lz4 dedup=off` (`ZFS_ATIME=on` to change). |
 
-**About `zpool create -f`:** OpenZFS refuses a pool whose top-level vdevs differ in redundancy — *mismatched replication level: draid and mirror vdevs with different redundancy, 3 vs. 1* — unless `-f` is given. dRAID3 data plus a 2-way-mirrored NVMe special vdev is exactly that (and the intended design), so the script adds `-f` automatically whenever the special layout's redundancy is below the dRAID parity and prints a note saying so. This does not weaken safety: the script's own in-use check on every selected device runs before `zpool create`. Log devices are exempt from the check; `raidz3x20` or `DRAID_PARITY=2` with `mirror3x6+2spare` need no `-f`.
+**About `zpool create -f`:** OpenZFS refuses a pool whose top-level vdevs differ in redundancy — *mismatched replication level* — unless `-f` is given. raidz3 or dRAID3 data plus a 2-way-mirrored NVMe special vdev is exactly that (and the intended design), so the script adds `-f` automatically whenever the special layout's redundancy is below the data-vdev parity and prints a note saying so. This does not weaken safety: the script's own in-use check on every selected device runs before `zpool create`. Log devices are exempt from the check. A 3-way-mirror special (`mirror3x…`, redundancy 2) still needs `-f` next to raidz3/dRAID3 (3 vs 2) but not next to raidz2/dRAID2; `raidz3x20` is the only special layout that never needs it.
 
 ### ARC sizing
 
@@ -309,7 +313,7 @@ Not every NVMe needs to go into the special vdev: metadata for a ~1.3 PiB pool i
 [2] RECOMMENDED — dRAID3 + special mirror5 (10 NVMe, 2-way mirrors), no L2ARC
 [3] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x3+1spare (10 NVMe, 3-way mirrors) + L2ARC
 [4] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x3+1spare (10 NVMe, 3-way mirrors), no L2ARC
-    Create:   POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-draid.sh --special=mirror3x3+1spare SEAGATE 104
+    Create:   POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --special=mirror3x3+1spare SEAGATE 104
 [5]…[8] ALTERNATIVE — all 20 eligible NVMe: mirror10 / mirror3x6+2spare, each with and without L2ARC
 ```
 
@@ -320,13 +324,13 @@ If a pool with the chosen name already exists (imported, or exported but still l
 **NVMe are discarded, not just unlabelled.** `zpool labelclear` and `wipefs` only erase the ZFS labels and signatures; the flash still holds every block the old pool wrote (visible as `Usage` in `nvme list`, e.g. ~300 GB per former special-vdev member). The script therefore runs `blkdiscard` (whole-device TRIM) on every former SSD member after a destroy and on every NVMe member right before `zpool create` (`DISCARD_NVME=1`, default), so a new pool always starts on clean flash. HDDs have no discard support and are skipped. To clean up NVMe left behind by an earlier destroy, run the standalone mode, which lists every unused NVMe (never a partitioned/mounted/labelled one), asks `y/N` and then for the word `WIPE`, and shows `nvme list` before and after:
 
 ```bash
-./zfs-draid.sh --wipe-nvme
+./zfs-pool-setup.sh --wipe-nvme
 ```
 
 ```bash
 # test cycle: dRAID3 9d:26c:2s + 3-way-mirror special, then destroy and rebuild
-POOL=data1 HDD_SPARE_COUNT=2 ./zfs-draid.sh --special=mirror3x6+2spare SEAGATE 104
-POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-draid.sh --special=mirror3x3+1spare SEAGATE 104   # asks to destroy data1 first
+POOL=data1 HDD_SPARE_COUNT=2 ./zfs-pool-setup.sh --special=mirror3x6+2spare SEAGATE 104
+POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --special=mirror3x3+1spare SEAGATE 104   # asks to destroy data1 first
 ```
 
 ### Reading the dRAID notation
@@ -353,10 +357,11 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 | `DESTROY_EXISTING=1` | With `SKIP_CONFIRM=1`: destroy an existing same-name pool without prompting. |
 | `--wipe-nvme`, `DISCARD_NVME=1\|0` | Standalone TRIM of all unused NVMe; whether create/destroy discard NVMe members (default 1). |
 | `DATA_DISK_SOURCE=mpath\|nvme` | Multipath HDDs (default) or all-flash NVMe data disks (no special vdev in that mode). |
-| `DRAID_PARITY=2\|3` | dRAID parity (default 3). |
+| `--raidz3`, `--raidz2`, `--draid` / `RAID_TOPOLOGY=` | Data vdev topology (assessment lists all; create default is dRAID). raidz* default width 13 (78 HDDs → 6 vdevs). |
+| `DRAID_PARITY=2\|3` | dRAID parity (default 3). Ignored for raidz*. |
 | `DRAID_PROFILE=balanced\|capacity` | Layout scoring; `capacity` maximises data disks with one wide group. |
 | `DRAID_MIN_SPARES=0..2` | Minimum distributed spares per vdev (default 1; 0 only for pure capacity). |
-| `DISKS_PER_VDEV=N` | Children per dRAID vdev (default 26; the assessment prints it when it differs). |
+| `DISKS_PER_VDEV=N` | Children per data vdev (dRAID default 26; raidz default 13). Validated: raidz2 ≥ 4, raidz3 ≥ 5, dRAID ≥ parity+2; a warning is printed above the sanity limit (`DRAID_MAX_WIDTH` 40, `RAIDZ_MAX_WIDTH` 15, raidz2 capped at 13 in the assessment). |
 | `HDD_SPARE_COUNT=N` | Extra matched HDDs (taken after the data disks) added as pool hot spares. |
 | `DRAID_MAX_WIDTH=N` | Widest vdev the assessment will propose (default 40). |
 | `ZFS_ARC_TUNE=1\|0`, `ZFS_ARC_MAX_PCT`, `ZFS_ARC_MIN_PCT`, `ZFS_DIRTY_DATA_MAX` | ARC sizing written to `/etc/modprobe.d/zfs.conf` after create (defaults 1 / 60 / 25 / 8 GiB). |
@@ -378,7 +383,7 @@ If a pool already exists without a special vdev and ≥10 NVMe are unused, the a
 
 ## Seed a new pool for lab tests
 
-[`zfs-blockclone.sh`](zfs-blockclone.sh) copies a dataset onto a newly provisioned pool (after [`zfs-draid.sh`](zfs-draid.sh)) so you can time NFS/client I/O, **scrub**, and **resilver**. It also has optional same-pool **block cloning** (OpenZFS BRT / `copy_file_range`) to make extra working copies without rewriting payload blocks.
+[`zfs-blockclone.sh`](zfs-blockclone.sh) copies a dataset onto a newly provisioned pool (after [`zfs-pool-setup.sh`](zfs-pool-setup.sh)) so you can time NFS/client I/O, **scrub**, and **resilver**. It also has optional same-pool **block cloning** (OpenZFS BRT / `copy_file_range`) to make extra working copies without rewriting payload blocks.
 
 Block cloning cannot copy between servers or between pools. Migration is `zfs send | zfs recv` or an NFS `rsync`. Both write **unique** blocks on the new pool — that is the seed you want for scrub/resilver. `clone-tree` afterwards **shares** those blocks (`USED` stays small) and does **not** add resilver work; use `copy-tree` for a second unique copy that fills capacity.
 
