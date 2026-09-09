@@ -9,12 +9,14 @@
 #                          7.68TB + 4× 800GB on Micron NVMe front bays; OS stays on rear SATA).
 #
 # Usage:
-#   zfs-pool-setup.sh                         # read-only assessment: inventory + ranked layouts
+#   zfs-pool-setup.sh                         # analyze: inventory + ranked create options (read-only)
+#   zfs-pool-setup.sh --analyze               # same as no arguments (--assess is an alias)
 #   zfs-pool-setup.sh [options] <disk_vendor_grep_pattern> [total_hdd_count]
 #   zfs-draid.sh is a compatibility symlink (same script; default topology remains dRAID).
 #
 # Examples:
-#   zfs-pool-setup.sh                            # report hardware; raidz3/raidz2/dRAID with special first
+#   zfs-pool-setup.sh                            # analyze: report hardware; raidz3/raidz2/dRAID with special first
+#   zfs-pool-setup.sh --analyze                  # same read-only report
 #   zfs-pool-setup.sh --raidz3 --special SEAGATE 78   # 78 disks → 6×13 raidz3 + default special
 #   zfs-pool-setup.sh --raidz2 --special SEAGATE 78   # 78 disks → 6×13 raidz2 + default special
 #   zfs-draid.sh SEAGATE                         # 78 disks → 3×26 dRAID vdevs (mpath; layout auto from DRAID_PARITY)
@@ -44,8 +46,10 @@
 #   SKIP_LOG_CACHE=1 Same as SLOG=N CACHE=N.
 #   ZPOOL_FORCE=1    Pass -f to zpool create (only after reviewing the in-use pre-check output).
 #   ZFS_ATIME        atime value for the pool root dataset (default: off)
-#   ZFS_ARC_TUNE     1 (default) writes /etc/modprobe.d/zfs.conf with zfs_arc_max/zfs_arc_min/zfs_dirty_data_max
-#                    after a successful create and applies them live via /sys; 0 skips. Sizing from MemTotal:
+#   ZFS_ARC_TUNE     1 (default) after a successful create: if /etc/modprobe.d/zfs.conf is absent,
+#                    write the proposed ARC sizing and apply it live. If that file already exists and
+#                    its zfs_arc_* / zfs_dirty_data_max values differ, leave it untouched and write the
+#                    proposal plus a why-it-differs note under $HOME. 0 skips. Sizing from MemTotal:
 #   ZFS_ARC_MAX_PCT  ARC max as % of RAM (default 60; OpenZFS default is 50)
 #   ZFS_ARC_MIN_PCT  ARC min as % of RAM (default 25)
 #   ZFS_DIRTY_DATA_MAX  bytes (default 8 GiB when RAM >= 128 GiB, else ZFS default)
@@ -507,14 +511,16 @@ EOF
 usage() {
   echo "Usage: $0 [options] [<disk_vendor_pattern> [total_hdd_count]]"
   echo
-  echo "With no disk vendor pattern, print a read-only assessment of this server"
-  echo "(inventory + ranked pool layouts). Priority is raidz3, then raidz2, then dRAID —"
-  echo "each WITH a special vdev when unused NVMe exist."
+  echo "With no disk vendor pattern (or --analyze), print a read-only analyze report of this"
+  echo "server: inventory plus ranked, copy/paste commands to create a new pool. Priority is"
+  echo "raidz3, then raidz2, then dRAID — each WITH a special vdev when unused NVMe exist."
+  echo "Analyze never changes host configuration."
   echo
   echo "Options:"
   echo "  -h, --help              Show this help"
   echo "      --help-special      Show special vdev layout choices"
-  echo "  -A, --assess            Force assessment report (also the default when no pattern is given)"
+  echo "  -A, --analyze           Read-only analyze report (also the default when no pattern is given)"
+  echo "      --assess            Alias for --analyze"
   echo "      --wipe-nvme         Discard (TRIM) every unused NVMe so it is clean for a new pool (asks twice)"
   echo "      --topology=TYPE     Data vdev topology: draid | raidz2 | raidz3 (default: draid)"
   echo "      --draid             Same as --topology=draid"
@@ -535,7 +541,7 @@ usage() {
   echo "         DISKS_PER_VDEV=N  HDD_SPARE_COUNT=N  DRAID_VDEV_SPEC=draidP:Dd:Cc:Ss  ZPOOL_FORCE=1  SKIP_CONFIRM=1"
   echo "By default a create run applies: mpathconf --enable --user_friendly_names n (unless"
   echo "SKIP_MPATH_MPATHCONF=1 or MPATH_USER_FRIENDLY_NAMES=1; skipped for nvme data)."
-  echo "Assessment mode never changes host config."
+  echo "Analyze mode (--analyze, or no vendor pattern) never changes host config."
   echo
   echo "Special vdev: SPECIAL=Y or --special for the default layout; --help-special for all layouts."
   echo "If a pool with the same name exists, create mode shows it and asks (twice) before destroying it."
@@ -678,7 +684,7 @@ parse_cli_args() {
         special_layout_help
         exit 0
         ;;
-      -A | --assess)
+      -A | --analyze | --analyse | --assess)
         ASSESS_ONLY=1
         shift
         ;;
@@ -850,7 +856,7 @@ fi
 # Device sizes (blockdev), blkid probing and multipath queries need root; assessment degrades silently otherwise.
 if (( EUID != 0 )); then
   if [[ "$ASSESS_ONLY" == "1" ]] || [[ $# -lt 1 ]]; then
-    echo "Warning: not running as root — device sizes/status may be missing or wrong in the assessment." >&2
+    echo "Warning: not running as root — device sizes/status may be missing or wrong in the analyze report." >&2
   else
     echo "Error: pool creation (and DRY_RUN discovery) must run as root." >&2
     exit 1
@@ -1083,11 +1089,12 @@ resolve_mpath_device() {
 # --- Shared "is this block device in use?" probe ---
 # Prints a short reason (partitioned, mounted:/x, swap, zfs_member, fstype:xfs, holder:lvm, not-disk:part)
 # and returns 1 when the device must not be given to zpool; prints nothing and returns 0 when it looks free.
-# Partition tables and child devices (partitions, LVM/md holders) are what the original checks missed —
-# a partitioned OS NVMe with only its partitions mounted looked "unused".
+# Partition tables and stacked holders (partitions, LVM, md, dm-crypt) are what the original checks
+# missed — a partitioned OS NVMe with only its partitions mounted looked "unused". Multipath path
+# slaves underneath a map are not holders and must not mark a free HDD as in use.
 device_in_use_reason() {
   local dev=$1
-  local btype mp fstype type pttype nchildren
+  local btype mp fstype type pttype
   [[ -b "$dev" ]] || { echo "unresolved"; return 1; }
   btype=$(lsblk -dn -o TYPE "$dev" 2>/dev/null || true)
   if [[ -n "${btype:-}" && "$btype" != disk && "$btype" != mpath ]]; then
@@ -1121,11 +1128,13 @@ device_in_use_reason() {
     echo "partitioned:${pttype}"
     return 1
   fi
-  # Children = partitions or holders (LVM LVs, md, dm-crypt) stacked on the device.
-  nchildren=$(lsblk -rn -o NAME "$dev" 2>/dev/null | wc -l | tr -d ' ')
-  if (( ${nchildren:-1} > 1 )); then
-    echo "has-children"
-    return 1
+  # Dependents stacked on this device (partitions, LVM, dm-crypt, md). A multipath map
+  # always lists its SCSI path slaves (TYPE=disk) as children; those are not "in use".
+  if command -v lsblk >/dev/null 2>&1; then
+    if lsblk -rn -o TYPE "$dev" 2>/dev/null | awk 'NR > 1 && $1 != "" && $1 != "disk" && $1 != "mpath" { found = 1 } END { exit found ? 0 : 1 }'; then
+      echo "has-children"
+      return 1
+    fi
   fi
   return 0
 }
@@ -1647,8 +1656,9 @@ discover_four_nvme_log_and_cache() {
 # --- ARC sizing (dedicated storage node): arc_max 60% / arc_min 25% of MemTotal, 8 GiB dirty data ---
 ARC_MEM_B=0 ARC_MAX_B=0 ARC_MIN_B=0 ARC_DIRTY_B=0
 compute_arc_sizing() {
-  local kb
-  kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  local kb meminfo=/proc/meminfo
+  [[ -n "${ZFS_MEMINFO:-}" ]] && meminfo=$ZFS_MEMINFO
+  kb=$(awk '/^MemTotal:/ {print $2}' "$meminfo" 2>/dev/null || echo 0)
   ARC_MEM_B=$(( ${kb:-0} * 1024 ))
   (( ARC_MEM_B > 0 )) || return 1
   ARC_MAX_B=$(( ARC_MEM_B * ZFS_ARC_MAX_PCT / 100 ))
@@ -1685,39 +1695,95 @@ print_arc_sizing() {
     printf '  zfs_dirty_data_max: %-16s (%s async write buffer; fuller dRAID stripes per txg)  current: %s\n' "$ARC_DIRTY_B" "$(human_bytes "$ARC_DIRTY_B")" "$(arc_current_value zfs_dirty_data_max)"
   fi
   echo "  Budget left for OS/NFS/dirty data/L2ARC headers/resilver: $(human_bytes $(( ARC_MEM_B - ARC_MAX_B )))"
-  echo "  /etc/modprobe.d/zfs.conf (written after create when ZFS_ARC_TUNE=1, default):"
+  echo "  Proposed /etc/modprobe.d/zfs.conf (after create, only if that file is absent or already matches):"
   echo "    options zfs zfs_arc_max=${ARC_MAX_B}"
   echo "    options zfs zfs_arc_min=${ARC_MIN_B}"
   (( ARC_DIRTY_B > 0 )) && echo "    options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
+  echo "  An existing zfs.conf with different values is left in place; the proposal is written under \$HOME."
   echo "  Metadata lives on the special vdev → leave zfs_arc_meta_balance default. Review arcstat l2hit% after"
   echo "  a few weeks; if L2ARC hit rate stays in single digits, repurpose the cache NVMe as hot spares."
   echo
 }
 
-# Post-create: persist + apply the ARC sizing (backs up an existing zfs.conf first).
-apply_arc_sizing() {
-  local conf=/etc/modprobe.d/zfs.conf ts p
-  if [[ "$ZFS_ARC_TUNE" != "1" ]]; then
-    echo "ZFS_ARC_TUNE=${ZFS_ARC_TUNE} — not writing ${conf}."
+# Why a proposed ARC parameter is sized this way (printed when an existing zfs.conf differs).
+arc_param_why() {
+  case "$1" in
+    zfs_arc_max)
+      echo "${ZFS_ARC_MAX_PCT}% of MemTotal ($(human_bytes "$ARC_MEM_B")), rounded down to a whole GiB; leaves about $((100 - ZFS_ARC_MAX_PCT))% for OS/NFS, dirty data, L2ARC headers and resilver. OpenZFS default is 50%."
+      ;;
+    zfs_arc_min)
+      echo "${ZFS_ARC_MIN_PCT}% of RAM as a floor so the ARC is not squeezed away under transient memory pressure, while still leaving room for the OOM-safe worst case."
+      ;;
+    zfs_dirty_data_max)
+      echo "8 GiB async write buffer when RAM is at least 128 GiB, so large NFS writes land as fuller data stripes per transaction group."
+      ;;
+    *)
+      echo "proposed by this script from host RAM"
+      ;;
+  esac
+}
+
+# Collect options-zfs name=value pairs from a modprobe file into ARC_CONF_PARAMS.
+arc_parse_conf_params() {
+  local file=$1 line tok key val
+  local -a _keys=()
+  for val in "${!ARC_CONF_PARAMS[@]}"; do
+    _keys+=("$val")
+  done
+  for val in ${_keys[@]+"${_keys[@]}"}; do
+    unset "ARC_CONF_PARAMS[$val]"
+  done
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    [[ "$line" =~ ^[[:space:]]*options[[:space:]]+zfs[[:space:]] ]] || continue
+    line="${line#*options}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line#zfs}"
+    for tok in $line; do
+      [[ "$tok" == *=* ]] || continue
+      key="${tok%%=*}"
+      val="${tok#*=}"
+      val="${val%\"}"
+      val="${val#\"}"
+      val="${val%\'}"
+      val="${val#\'}"
+      ARC_CONF_PARAMS["$key"]="$val"
+    done
+  done <"$file"
+}
+
+arc_proposal_home() {
+  local h="" uh
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    uh=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+    [[ -n "$uh" && -d "$uh" && -w "$uh" ]] && h=$uh
+  fi
+  if [[ -z "$h" ]]; then
+    h="${HOME:-}"
+  fi
+  if [[ -n "$h" && -d "$h" && -w "$h" ]]; then
+    echo "$h"
     return 0
   fi
-  if ! compute_arc_sizing; then
-    echo "Warning: MemTotal unavailable — skipping ARC tuning." >&2
+  if [[ -d /root && -w /root ]]; then
+    echo /root
     return 0
   fi
-  ts=$(date +%Y%m%d-%H%M%S)
-  if [[ -f "$conf" ]]; then
-    cp -p "$conf" "${conf}.bak-${ts}" && echo "Backed up existing ${conf} → ${conf}.bak-${ts}"
+  echo /tmp
+}
+
+# Write the proposed modprobe snippet (no comparison header) to stdout.
+arc_proposed_options() {
+  echo "options zfs zfs_arc_max=${ARC_MAX_B}"
+  echo "options zfs zfs_arc_min=${ARC_MIN_B}"
+  if (( ARC_DIRTY_B > 0 )); then
+    echo "options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
   fi
-  {
-    echo "# ZFS ARC sizing written by $(basename "$SCRIPT_PATH") on ${ts} (RAM $(human_bytes "$ARC_MEM_B"), pool ${POOL})"
-    echo "# ${ZFS_ARC_MAX_PCT}% / ${ZFS_ARC_MIN_PCT}% of MemTotal; re-run with ZFS_ARC_MAX_PCT/ZFS_ARC_MIN_PCT to change."
-    echo "options zfs zfs_arc_max=${ARC_MAX_B}"
-    echo "options zfs zfs_arc_min=${ARC_MIN_B}"
-    (( ARC_DIRTY_B > 0 )) && echo "options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
-  } >"$conf" || { echo "Warning: could not write ${conf}." >&2; return 0; }
-  echo "Wrote ${conf}:"
-  sed 's/^/  /' "$conf"
+}
+
+arc_apply_live() {
+  local p
   for p in "zfs_arc_max=${ARC_MAX_B}" "zfs_arc_min=${ARC_MIN_B}"; do
     if [[ -w "/sys/module/zfs/parameters/${p%%=*}" ]]; then
       echo "${p#*=}" >"/sys/module/zfs/parameters/${p%%=*}" 2>/dev/null && echo "Applied live: ${p}" || echo "Warning: could not apply ${p} live (takes effect after reboot)." >&2
@@ -1728,10 +1794,127 @@ apply_arc_sizing() {
       echo "Applied live: zfs_dirty_data_max=${ARC_DIRTY_B}"
     fi
   fi
-  echo "Note: run 'dracut -f' if the zfs module is part of the initramfs, so the values also apply at early boot."
 }
 
-# --- Read-only assessment (./zfs-draid.sh with no vendor pattern) ---
+# Post-create: persist ARC sizing only when /etc/modprobe.d/zfs.conf is absent or already matches.
+# A differing existing file is left alone; the proposal and the comparison go under $HOME.
+apply_arc_sizing() {
+  local conf="${ZFS_MODPROBE_CONF:-/etc/modprobe.d/zfs.conf}" ts home dest key have need need_update=0
+  local -a proposed_keys=()
+  declare -A ARC_CONF_PARAMS=()
+  if [[ "$ZFS_ARC_TUNE" != "1" ]]; then
+    echo "ZFS_ARC_TUNE=${ZFS_ARC_TUNE} — not writing ${conf}."
+    return 0
+  fi
+  if ! compute_arc_sizing; then
+    echo "Warning: MemTotal unavailable — skipping ARC tuning." >&2
+    return 0
+  fi
+
+  proposed_keys=(zfs_arc_max zfs_arc_min)
+  (( ARC_DIRTY_B > 0 )) && proposed_keys+=(zfs_dirty_data_max)
+
+  if [[ ! -e "$conf" ]]; then
+    ts=$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$(dirname "$conf")" 2>/dev/null || true
+    {
+      echo "# ZFS ARC sizing written by $(basename "$SCRIPT_PATH") on ${ts} (RAM $(human_bytes "$ARC_MEM_B"), pool ${POOL})"
+      echo "# ${ZFS_ARC_MAX_PCT}% / ${ZFS_ARC_MIN_PCT}% of MemTotal; re-run with ZFS_ARC_MAX_PCT/ZFS_ARC_MIN_PCT to change."
+      arc_proposed_options
+    } >"$conf" || { echo "Warning: could not write ${conf}." >&2; return 0; }
+    echo "Wrote ${conf} (no previous file):"
+    sed 's/^/  /' "$conf"
+    arc_apply_live
+    echo "Note: run 'dracut -f' if the zfs module is part of the initramfs, so the values also apply at early boot."
+    return 0
+  fi
+
+  arc_parse_conf_params "$conf"
+  for key in "${proposed_keys[@]}"; do
+    have="${ARC_CONF_PARAMS[$key]:-}"
+    case "$key" in
+      zfs_arc_max) need=$ARC_MAX_B ;;
+      zfs_arc_min) need=$ARC_MIN_B ;;
+      zfs_dirty_data_max) need=$ARC_DIRTY_B ;;
+    esac
+    if [[ -z "$have" || "$have" != "$need" ]]; then
+      need_update=1
+    fi
+  done
+
+  if (( need_update == 0 )); then
+    echo "Existing ${conf} already has the proposed ARC values — left unchanged."
+    arc_apply_live
+    return 0
+  fi
+
+  ts=$(date +%Y%m%d-%H%M%S)
+  home=$(arc_proposal_home)
+  dest="${home}/zfs.conf.proposed-$(hostname -s 2>/dev/null || hostname)-${ts}"
+  {
+    echo "# Proposed ZFS module options from $(basename "$SCRIPT_PATH")"
+    echo "# Host: $(hostname)   Date: $(date -Is 2>/dev/null || date)   Pool: ${POOL}"
+    echo "# RAM (MemTotal): $(human_bytes "$ARC_MEM_B")"
+    echo "#"
+    echo "# ${conf} already exists and differs from this proposal."
+    echo "# That file was NOT modified, and the live /sys/module/zfs/parameters were NOT changed."
+    echo "# Install only after review:"
+    echo "#   cp ${dest} ${conf}"
+    echo "#   dracut -f    # if the zfs module is in the initramfs"
+    echo "#"
+    echo "# What differs, and why:"
+    for key in "${proposed_keys[@]}"; do
+      have="${ARC_CONF_PARAMS[$key]:-}"
+      case "$key" in
+        zfs_arc_max) need=$ARC_MAX_B ;;
+        zfs_arc_min) need=$ARC_MIN_B ;;
+        zfs_dirty_data_max) need=$ARC_DIRTY_B ;;
+      esac
+      echo "#   ${key}"
+      if [[ -z "$have" ]]; then
+        echo "#     existing:  (not set in ${conf})"
+      else
+        echo "#     existing:  ${have} ($(human_bytes "$have"))"
+      fi
+      echo "#     proposed:  ${need} ($(human_bytes "$need"))"
+      if [[ -z "$have" ]]; then
+        echo "#     change:    add — $(arc_param_why "$key")"
+      elif [[ "$have" == "$need" ]]; then
+        echo "#     change:    same value"
+      else
+        echo "#     change:    replace ${have} with ${need} — $(arc_param_why "$key")"
+      fi
+    done
+    local extra=0
+    if ((${#ARC_CONF_PARAMS[@]} > 0)); then
+      for key in "${!ARC_CONF_PARAMS[@]}"; do
+        case "$key" in
+          zfs_arc_max | zfs_arc_min | zfs_dirty_data_max) continue ;;
+        esac
+        if (( extra == 0 )); then
+          echo "#"
+          echo "# Other options zfs settings in the existing file (copied below so a reviewed install does not drop them):"
+          extra=1
+        fi
+        echo "#   ${key}=${ARC_CONF_PARAMS[$key]}"
+      done
+    fi
+    echo
+    arc_proposed_options
+    for key in "${!ARC_CONF_PARAMS[@]}"; do
+      case "$key" in
+        zfs_arc_max | zfs_arc_min | zfs_dirty_data_max) continue ;;
+      esac
+      echo "options zfs ${key}=${ARC_CONF_PARAMS[$key]}"
+    done
+  } >"$dest" || { echo "Warning: could not write proposed ARC file under ${home}." >&2; return 0; }
+
+  echo "Existing ${conf} differs from the proposed ARC sizing — system file left unchanged."
+  echo "Comparison and proposed file: ${dest}"
+  sed 's/^/  /' "$dest"
+}
+
+# --- Read-only analyze (./zfs-pool-setup.sh with no vendor pattern, or --analyze) ---
 human_bytes() {
   awk -v b="${1:-0}" 'BEGIN {
     if (b >= 1125899906842624) printf "%.2f PiB", b/1125899906842624
@@ -2003,6 +2186,7 @@ assess_print_create_option() {
   case "$topology" in
     raidz2) topo_flag="--raidz2 " ;;
     raidz3) topo_flag="--raidz3 " ;;
+    draid) topo_flag="--draid " ;;
   esac
   if [[ -n "$layout" ]]; then
     cmd="./$(basename "$SCRIPT_PATH") ${topo_flag}--special=${layout} ${vendor} ${ndisks}"
@@ -2035,6 +2219,11 @@ assess_print_raidz_recommended() {
   ASSESS_TOPOLOGY="raidz${parity}"
   mapfile -t cand_layouts < <(assess_candidate_layouts "$special_fit")
   ((${#cand_layouts[@]} > 0)) && [[ -n "${cand_layouts[0]:-}" ]] || return 0
+  if (( SPECIAL_ENABLED )) && [[ -n "${SPECIAL_LAYOUT:-}" ]]; then
+    if (( $(special_layout_nvme_total "$SPECIAL_LAYOUT" 2>/dev/null || echo 999) <= special_fit )); then
+      [[ " ${cand_layouts[*]} " == *" ${SPECIAL_LAYOUT} "* ]] || cand_layouts+=("$SPECIAL_LAYOUT")
+    fi
+  fi
   def2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
   def3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
   # Fewer than SPECIAL_NVME_COUNT eligible NVMe: recommend the largest layouts that do fit instead.
@@ -2057,6 +2246,13 @@ assess_print_raidz_recommended() {
         "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
       assess_print_create_option \
         "RECOMMENDED (extra redundancy) — raidz${parity} + special ${layout} ($(special_layout_nvme_total "$layout") NVMe, 3-way mirrors), no L2ARC" \
+        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
+    elif [[ -n "${SPECIAL_LAYOUT:-}" && "$layout" == "$SPECIAL_LAYOUT" ]]; then
+      assess_print_create_option \
+        "REQUESTED — raidz${parity} + special ${layout} ($(special_layout_summary "$layout")) + L2ARC" \
+        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
+      assess_print_create_option \
+        "REQUESTED — raidz${parity} + special ${layout}, no L2ARC" \
         "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
     fi
   done
@@ -2087,12 +2283,12 @@ run_storage_assessment() {
     alias_maps=0
     declare -A grp_count=() grp_unused=() grp_vendor=() grp_product=() grp_size=()
     declare -A nvme_sz_unused=()
-    echo "================ STORAGE SERVER ASSESSMENT ================"
+    echo "================ STORAGE SERVER ANALYZE ================"
     echo "Host:              $host"
     echo "Date:              $(date -Is 2>/dev/null || date)"
     echo "Suggested pool:    $POOL  (${POOL_NAME_SOURCE}; create mode asks you to verify)"
     echo "Script:            $SCRIPT_PATH"
-    echo "Mode:              read-only (no mpathconf, no zpool create)"
+    echo "Mode:              analyze (read-only; no mpathconf, no zpool create)"
     if command -v zfs >/dev/null 2>&1; then
       zfsver=$(zfs version 2>/dev/null | head -n1 || true)
       echo "ZFS:               ${zfsver:-installed (version unknown)}"
@@ -2256,8 +2452,8 @@ run_storage_assessment() {
     echo "Ranked: raidz3, raidz2, then dRAID. Commands are copy/paste; dry-run first, then drop DRY_RUN=1."
     echo "A special vdev is listed whenever unused NVMe fit a layout; without NVMe, HDD-only is last resort."
     if (( SPECIAL_ENABLED )); then
-      echo "Note: special layout '${SPECIAL_LAYOUT}' was requested on the CLI; recommended remains the"
-      echo "      highest-ranked special vdev that fits, with your layout listed among the alternatives."
+      echo "Note: special layout '${SPECIAL_LAYOUT}' was requested on the CLI. Ranked options still"
+      echo "      prefer raidz3/raidz2 with a special vdev; your layout is included when it fits."
     fi
     echo
 
@@ -2290,6 +2486,11 @@ run_storage_assessment() {
       # Candidate special layouts that fit; the default-count layouts (2-way, then 3-way) are RECOMMENDED,
       # each shown with L2ARC and without (CACHE=N). Larger/raidz layouts follow as alternatives.
       mapfile -t cand_layouts < <(assess_candidate_layouts "$special_fit")
+      if (( SPECIAL_ENABLED )) && [[ -n "$SPECIAL_LAYOUT" ]]; then
+        if (( $(special_layout_nvme_total "$SPECIAL_LAYOUT" 2>/dev/null || echo 999) <= special_fit )); then
+          [[ " ${cand_layouts[*]} " == *" ${SPECIAL_LAYOUT} "* ]] || cand_layouts+=("$SPECIAL_LAYOUT")
+        fi
+      fi
       best_layout="${cand_layouts[0]:-}"
       def2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
       def3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
@@ -2320,6 +2521,14 @@ run_storage_assessment() {
               "ALTERNATIVE (extra redundancy) — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 3-way mirrors), no L2ARC" \
               3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
           else
+            if [[ -n "${SPECIAL_LAYOUT:-}" && "$layout" == "$SPECIAL_LAYOUT" ]]; then
+              assess_print_create_option \
+                "REQUESTED — dRAID3 + special ${layout} ($(special_layout_summary "$layout")) + L2ARC" \
+                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+              assess_print_create_option \
+                "REQUESTED — dRAID3 + special ${layout}, no L2ARC" \
+                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+            else
             case "$layout" in
               raidz*)
                 assess_print_create_option \
@@ -2343,6 +2552,7 @@ run_storage_assessment() {
                   3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
                 ;;
             esac
+            fi
           fi
         done
         if (( alt_width > 0 )); then
@@ -2383,8 +2593,8 @@ run_storage_assessment() {
       echo "    Data:     ${nvme_data_n}× $(human_bytes "$large_sz")  →  1 × ${spec:-draid3}"
       echo "    Aux:      4 remaining smaller/other NVMe → log + cache"
       echo "    Special:  not supported with DATA_DISK_SOURCE=nvme"
-      echo "    Create:   POOL=${POOL} DATA_DISK_SOURCE=nvme ${ASSESS_SELF} ${nvme_pat} ${nvme_data_n}"
-      echo "    Dry-run:  POOL=${POOL} DATA_DISK_SOURCE=nvme DRY_RUN=1 ${ASSESS_SELF} ${nvme_pat} ${nvme_data_n}"
+      echo "    Create:   POOL=${POOL} DATA_DISK_SOURCE=nvme ${ASSESS_SELF} --draid ${nvme_pat} ${nvme_data_n}"
+      echo "    Dry-run:  POOL=${POOL} DATA_DISK_SOURCE=nvme DRY_RUN=1 ${ASSESS_SELF} --draid ${nvme_pat} ${nvme_data_n}"
       echo
     fi
 
@@ -2450,10 +2660,16 @@ run_storage_assessment() {
           continue
         fi
         add_n=$(special_layout_special_disk_count "$add_layout")
+        spare_n=$(special_layout_pool_spare_count "$add_layout" || echo 0)
         spec_paths=()
+        spare_paths=()
         for ((i = 0; i < add_n && i < ${#nv_sorted[@]}; i++)); do
           read -r _ row_path <<<"${nv_sorted[i]}"
           spec_paths+=("$(basename "$row_path")")
+        done
+        for ((i = add_n; i < add_n + spare_n && i < ${#nv_sorted[@]}; i++)); do
+          read -r _ row_path <<<"${nv_sorted[i]}"
+          spare_paths+=("$(basename "$row_path")")
         done
         ((++ASSESS_RANK))
         enhanced=1
@@ -2461,6 +2677,9 @@ run_storage_assessment() {
         echo "  WARNING: adding special is pool-critical (loss of special = loss of pool)."
         _zpool_cmd=(zpool add "$p")
         if append_special_vdev_to_zpool_cmd "$add_layout" "${spec_paths[@]}" 2>/dev/null; then
+          if ((${#spare_paths[@]} > 0)); then
+            _zpool_cmd+=(spare "${spare_paths[@]}")
+          fi
           echo "  Dry-run add:"
           echo "    zpool add -n ${p} special ...   # preview, then:"
           printf '    '
@@ -2490,7 +2709,7 @@ run_storage_assessment() {
   } | tee "$logf"
 
   echo
-  echo "Assessment log: $logf"
+  echo "Analyze log: $logf"
 }
 
 # --- Standalone NVMe wipe mode ---

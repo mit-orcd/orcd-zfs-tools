@@ -192,7 +192,7 @@ This provisions dataset `<pool>/<PiKerbName>_shared` with group `orcd_rg_shared_
 
 [`zfs-pool-setup.sh`](zfs-pool-setup.sh) is run **on a new ZFS storage server** (RHEL, OpenZFS ≥ 2.1 for dRAID, `device-mapper-multipath`). [`zfs-draid.sh`](zfs-draid.sh) is a compatibility symlink to the same script (create default remains dRAID). Two modes:
 
-1. **Assessment** (no arguments) — read-only. Inventories multipath HDDs and NVMe, checks which special-vdev layouts fit, and prints ranked, copy/paste deployment commands. It never changes host configuration.
+1. **Analyze** (no arguments, or `--analyze`; `--assess` is an alias) — read-only. Inventories multipath HDDs and NVMe, checks which special-vdev layouts fit, and prints ranked, copy/paste commands to create a new pool. It never changes host configuration.
 2. **Create** (`[--raidz3|--raidz2|--draid] <vendor_pattern> [total_hdd_count]`) — builds the `zpool create` command, shows the full layout, asks for confirmation, creates the pool, then applies the ORCD follow-ups (encrypted `<pool>/orcd` dataset if a key exists, monthly scrub timer, backup of script + key).
 
 The priority is **raidz3, then raidz2, then dRAID**, each **with a mirrored NVMe special vdev** (metadata / small blocks) when unused NVMe exist. Without a special vdev, metadata lives on HDD and directory-heavy HPC workloads suffer. 78 HDDs → `6 × raidz3` of 13 (classic) or `3 × draid3` of 26.
@@ -216,13 +216,14 @@ Verify pool name — press Enter to keep 'data1', or type another name:
 
 Enter keeps it, typing a name replaces it (validated as a legal pool name). If a pool with that name already exists, the script offers to destroy and clean it up first (see below). `SKIP_CONFIRM=1` or a non-interactive stdin accepts the default silently.
 
-### Step 1 — assess
+### Step 1 — analyze
 
 ```bash
-./zfs-pool-setup.sh            # or: ./zfs-draid.sh --assess
+./zfs-pool-setup.sh            # or: ./zfs-pool-setup.sh --analyze
+./zfs-draid.sh --analyze       # same script; --assess is an alias
 ```
 
-The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing pools, an HDD table (vendor / product / size / total / free), NVMe split into *unused* and *in use*, which special layouts fit, and a ranked list. **raidz3 and raidz2 with a special vdev are first**; dRAID follows as an alternative. Example:
+The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing pools, an HDD table (vendor / product / size / total / free), NVMe split into *unused* and *in use*, which special layouts fit, and a ranked list of **create-a-new-pool** options. **raidz3 and raidz2 with a special vdev are first**; dRAID follows as an alternative. Example:
 
 ```text
 --- raidz3 (78 data disks → 6 × raidz3 of 13; leftover 0 spare) ---
@@ -239,10 +240,11 @@ The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing
 --- dRAID (distributed parity; sequential rebuild) ---
 [n] ALTERNATIVE — dRAID3 + special mirror5 …
     Data:     78× 18.19 TiB SEAGATE  →  3 × draid3:9d:26c:2s
-    Create:   POOL=data1 ./zfs-pool-setup.sh --special=mirror5 SEAGATE 78
+    Create:   POOL=data1 ./zfs-pool-setup.sh --draid --special=mirror5 SEAGATE 78
+    Dry-run:  POOL=data1 DRY_RUN=1 ./zfs-pool-setup.sh --draid --special=mirror5 SEAGATE 78
 ```
 
-A disk counts as *unused* only if it has no filesystem, no partition table, no ZFS label, no mount and no LVM/md/LUKS holder — so the OS NVMe is never offered as SLOG/special.
+A disk counts as *unused* only if it has no filesystem, no partition table, no ZFS label, no mount and no LVM/md/LUKS holder — so the OS NVMe is never offered as SLOG/special. Multipath path slaves under a map are not treated as “in use”; those are the SAS paths, not a stacked filesystem.
 
 ### Step 2 — dry run
 
@@ -277,7 +279,7 @@ mpathconf --enable --user_friendly_names n && systemctl restart multipathd && mu
 # if aliases persist: multipath -F && multipath -r  (or reboot; see /etc/multipath/bindings)
 ```
 
-The assessment report shows the current naming mode (`Map naming: WWID` or `mpathX aliases on N maps`).
+The analyze report shows the current naming mode (`Map naming: WWID` or `mpathX aliases on N maps`).
 
 ### What gets created
 
@@ -292,7 +294,7 @@ The assessment report shows the current naming mode (`Map naming: WWID` or `mpat
 
 ### ARC sizing
 
-The assessment prints an **ARC sizing** block computed from the host's `MemTotal`, and a successful create writes it to `/etc/modprobe.d/zfs.conf` (backing up any existing file) and applies it live via `/sys/module/zfs/parameters`:
+The analyze report prints an **ARC sizing** block computed from the host's `MemTotal`. After a successful create, that proposal is written to `/etc/modprobe.d/zfs.conf` only when the file is **absent**. If the file already exists and its `zfs_arc_max` / `zfs_arc_min` / `zfs_dirty_data_max` values differ, the script leaves it untouched, does not change live `/sys` parameters, and writes the proposal plus a line-by-line comparison (what changed, and why) under `$HOME` as `zfs.conf.proposed-<host>-<timestamp>`. If the existing file already has the proposed values, it is left as-is and those values are applied live.
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
@@ -300,20 +302,20 @@ The assessment prints an **ARC sizing** block computed from the host's `MemTotal
 | `zfs_arc_min` | 25% of RAM (`ZFS_ARC_MIN_PCT`) | Floor so the ARC is not squeezed away under transient pressure, while leaving room for the OOM-safe worst case. |
 | `zfs_dirty_data_max` | 8 GiB when RAM ≥ 128 GiB (`ZFS_DIRTY_DATA_MAX`) | Larger write buffer so big NFS writes land as fuller 12-disk dRAID stripes per transaction group. |
 
-For a 250 GB node that is about `zfs_arc_max` ≈ 140 GiB and `zfs_arc_min` ≈ 58 GiB (values are rounded down to whole GiB from the actual `MemTotal`). `ZFS_ARC_TUNE=0` skips writing the file. Run `dracut -f` afterwards if the zfs module is in the initramfs. Metadata sits on the special vdev, so leave `zfs_arc_meta_balance` at its default; check `arcstat` `l2hit%` after a few weeks and repurpose the L2ARC NVMe as hot spares if it stays in single digits.
+For a 250 GB node that is about `zfs_arc_max` ≈ 140 GiB and `zfs_arc_min` ≈ 58 GiB (values are rounded down to whole GiB from the actual `MemTotal`). `ZFS_ARC_TUNE=0` skips both the system file and the `$HOME` proposal. Run `dracut -f` afterwards only if you install a new `zfs.conf` and the zfs module is in the initramfs. Metadata sits on the special vdev, so leave `zfs_arc_meta_balance` at its default; check `arcstat` `l2hit%` after a few weeks and repurpose the L2ARC NVMe as hot spares if it stays in single digits.
 
 After creation, turn on small-block placement per dataset only when measured: `zfs set special_small_blocks=16K data1/<dataset>`.
 
 ### Special vdev size and the L2ARC question
 
-Not every NVMe needs to go into the special vdev: metadata for a ~1.3 PiB pool is a few TB, so 10 NVMe (5 mirror pairs ≈ 35 TiB, or 3 triple mirrors ≈ 21 TiB) is plenty and the rest can be added later with `zpool add <pool> special mirror …` once real usage is known. The assessment therefore recommends the 10-NVMe layouts first, in both mirror widths, and prints every recommendation **with and without L2ARC** (`CACHE=N`); with ~140 GiB of ARC and metadata on NVMe, L2ARC rarely earns its two devices. Example for this hardware:
+Not every NVMe needs to go into the special vdev: metadata for a ~1.3 PiB pool is a few TB, so 10 NVMe (5 mirror pairs ≈ 35 TiB, or 3 triple mirrors ≈ 21 TiB) is plenty and the rest can be added later with `zpool add <pool> special mirror …` once real usage is known. Analyze therefore recommends the 10-NVMe layouts first, in both mirror widths, and prints every recommendation **with and without L2ARC** (`CACHE=N`); with ~140 GiB of ARC and metadata on NVMe, L2ARC rarely earns its two devices. Example for this hardware:
 
 ```text
 [1] RECOMMENDED — dRAID3 + special mirror5 (10 NVMe, 2-way mirrors) + L2ARC
 [2] RECOMMENDED — dRAID3 + special mirror5 (10 NVMe, 2-way mirrors), no L2ARC
 [3] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x3+1spare (10 NVMe, 3-way mirrors) + L2ARC
 [4] RECOMMENDED (extra redundancy) — dRAID3 + special mirror3x3+1spare (10 NVMe, 3-way mirrors), no L2ARC
-    Create:   POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --special=mirror3x3+1spare SEAGATE 104
+    Create:   POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --draid --special=mirror3x3+1spare SEAGATE 104
 [5]…[8] ALTERNATIVE — all 20 eligible NVMe: mirror10 / mirror3x6+2spare, each with and without L2ARC
 ```
 
@@ -329,8 +331,8 @@ If a pool with the chosen name already exists (imported, or exported but still l
 
 ```bash
 # test cycle: dRAID3 9d:26c:2s + 3-way-mirror special, then destroy and rebuild
-POOL=data1 HDD_SPARE_COUNT=2 ./zfs-pool-setup.sh --special=mirror3x6+2spare SEAGATE 104
-POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --special=mirror3x3+1spare SEAGATE 104   # asks to destroy data1 first
+POOL=data1 HDD_SPARE_COUNT=2 ./zfs-pool-setup.sh --draid --special=mirror3x6+2spare SEAGATE 104
+POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --draid --special=mirror3x3+1spare SEAGATE 104   # asks to destroy data1 first
 ```
 
 ### Reading the dRAID notation
@@ -344,27 +346,27 @@ POOL=data1 HDD_SPARE_COUNT=2 CACHE=N ./zfs-pool-setup.sh --special=mirror3x3+1sp
 | `<C>c` | **children**: physical disks in this vdev | 26 |
 | `<S>s` | **distributed spares**: spare capacity spread over all children for fast in-place rebuild | 2 |
 
-Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 2 groups per vdev, so a 26-disk vdev holds 18 data-disk equivalents. The assessment chooses the vdev width (8…`DRAID_MAX_WIDTH`, default 40) that gives the most usable capacity, then prefers ~8-disk data stripes, two groups per vdev, and the proven 26 width; leftover HDDs are proposed as pool hot spares (`HDD_SPARE_COUNT`). Example: 106 HDDs → `4 × draid3:9d:26c:2s` + 2 hot spares. It never proposes one huge vdev (e.g. `draid3:32d:106c:1s`, whose 32-wide stripes waste space on small blocks and leave a single spare for 106 disks).
+Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 2 groups per vdev, so a 26-disk vdev holds 18 data-disk equivalents. Analyze chooses the vdev width (8…`DRAID_MAX_WIDTH`, default 40) that gives the most usable capacity, then prefers ~8-disk data stripes, two groups per vdev, and the proven 26 width; leftover HDDs are proposed as pool hot spares (`HDD_SPARE_COUNT`). Example: 106 HDDs → `4 × draid3:9d:26c:2s` + 2 hot spares. It never proposes one huge vdev (e.g. `draid3:32d:106c:1s`, whose 32-wide stripes waste space on small blocks and leave a single spare for 106 disks).
 
 ### Options and environment
 
 | Setting | Meaning |
 |---------|---------|
-| `-A, --assess` | Force the read-only report. |
+| `-A, --analyze` | Read-only report of free disks and ranked create commands. Also the default when no vendor pattern is given. `--assess` is an alias. |
 | `-S, --special[=layout]` / `SPECIAL=Y\|layout` | Enable the special vdev (default: `SPECIAL_NVME_COUNT` NVMe as `SPECIAL_MIRROR_WAY`-way mirrors → `mirror5`). |
 | `SPECIAL_NVME_COUNT=N`, `SPECIAL_MIRROR_WAY=2\|3` | Size/width of the default special layout (10 / 2). |
 | `SLOG=Y\|N`, `CACHE=Y\|N` | SLOG mirror / L2ARC on the smallest NVMe (defaults Y; `CACHE=N` common). |
 | `DESTROY_EXISTING=1` | With `SKIP_CONFIRM=1`: destroy an existing same-name pool without prompting. |
 | `--wipe-nvme`, `DISCARD_NVME=1\|0` | Standalone TRIM of all unused NVMe; whether create/destroy discard NVMe members (default 1). |
 | `DATA_DISK_SOURCE=mpath\|nvme` | Multipath HDDs (default) or all-flash NVMe data disks (no special vdev in that mode). |
-| `--raidz3`, `--raidz2`, `--draid` / `RAID_TOPOLOGY=` | Data vdev topology (assessment lists all; create default is dRAID). raidz* default width 13 (78 HDDs → 6 vdevs). |
+| `--raidz3`, `--raidz2`, `--draid` / `RAID_TOPOLOGY=` | Data vdev topology (analyze lists all; create default is dRAID). raidz* default width 13 (78 HDDs → 6 vdevs). |
 | `DRAID_PARITY=2\|3` | dRAID parity (default 3). Ignored for raidz*. |
 | `DRAID_PROFILE=balanced\|capacity` | Layout scoring; `capacity` maximises data disks with one wide group. |
 | `DRAID_MIN_SPARES=0..2` | Minimum distributed spares per vdev (default 1; 0 only for pure capacity). |
-| `DISKS_PER_VDEV=N` | Children per data vdev (dRAID default 26; raidz default 13). Validated: raidz2 ≥ 4, raidz3 ≥ 5, dRAID ≥ parity+2; a warning is printed above the sanity limit (`DRAID_MAX_WIDTH` 40, `RAIDZ_MAX_WIDTH` 15, raidz2 capped at 13 in the assessment). |
+| `DISKS_PER_VDEV=N` | Children per data vdev (dRAID default 26; raidz default 13). Validated: raidz2 ≥ 4, raidz3 ≥ 5, dRAID ≥ parity+2; a warning is printed above the sanity limit (`DRAID_MAX_WIDTH` 40, `RAIDZ_MAX_WIDTH` 15, raidz2 capped at 13 in analyze). |
 | `HDD_SPARE_COUNT=N` | Extra matched HDDs (taken after the data disks) added as pool hot spares. |
-| `DRAID_MAX_WIDTH=N` | Widest vdev the assessment will propose (default 40). |
-| `ZFS_ARC_TUNE=1\|0`, `ZFS_ARC_MAX_PCT`, `ZFS_ARC_MIN_PCT`, `ZFS_DIRTY_DATA_MAX` | ARC sizing written to `/etc/modprobe.d/zfs.conf` after create (defaults 1 / 60 / 25 / 8 GiB). |
+| `DRAID_MAX_WIDTH=N` | Widest vdev analyze will propose (default 40). |
+| `ZFS_ARC_TUNE=1\|0`, `ZFS_ARC_MAX_PCT`, `ZFS_ARC_MIN_PCT`, `ZFS_DIRTY_DATA_MAX` | After create, write ARC sizing to `/etc/modprobe.d/zfs.conf` only if that file is absent (defaults 1 / 60 / 25 / 8 GiB). A differing existing file is left alone; the proposal and the comparison go to `$HOME/zfs.conf.proposed-<host>-<ts>`. |
 | `DRY_RUN=1` | Discovery + command + log only. |
 | `POOL=name` | Pool name (default from hostname rule above; always verified interactively). |
 | `SKIP_CONFIRM=1` | No interactive prompts (pool-name verification and the final zpool create confirmation). |
@@ -377,7 +379,7 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 
 ### Adding a special vdev to an existing pool
 
-If a pool already exists without a special vdev and ≥10 NVMe are unused, the assessment prints a ready `zpool add <pool> special mirror …` line. Preview with `zpool add -n` first. Remember that **losing an entire special vdev loses the pool** — always use mirrors in production.
+If a pool already exists without a special vdev and ≥10 NVMe are unused, analyze prints a ready `zpool add <pool> special mirror …` line. Preview with `zpool add -n` first. Remember that **losing an entire special vdev loses the pool** — always use mirrors in production.
 
 ---
 
