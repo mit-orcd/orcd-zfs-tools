@@ -2258,6 +2258,75 @@ assess_print_raidz_recommended() {
   done
 }
 
+# SAS shelf count plus a two-JBOD bring-up checklist. Read-only; does not create pools.
+assess_print_jbod_and_test_plan() {
+  local hdd_n=$1 unused_nvme=$2
+  local enc=0 enc_dir name vendor model slots
+  local -a enc_lines=()
+  echo "--- JBOD / second shelf ---"
+  echo "  Quick check (same facts, no script):"
+  echo "    ls -d /sys/class/enclosure/*/ 2>/dev/null | wc -l"
+  echo "    lsscsi -g | grep -iE 'enclos|expander'"
+  echo "    multipath -l | grep -c SEAGATE"
+  echo
+  if [[ -d /sys/class/enclosure ]]; then
+    for enc_dir in /sys/class/enclosure/*; do
+      [[ -e "$enc_dir" ]] || continue
+      [[ -d "$enc_dir" ]] || continue
+      enc=$((enc + 1))
+      name=$(basename "$enc_dir")
+      vendor=$(tr -d ' \0' <"$enc_dir/device/vendor" 2>/dev/null || true)
+      model=$(tr -d ' \0' <"$enc_dir/device/model" 2>/dev/null || true)
+      slots=$(ls -d "$enc_dir"/Slot* 2>/dev/null | wc -l | tr -d ' ')
+      enc_lines+=("$(printf '    %s  %s %s  slots=%s' "$name" "${vendor:-?}" "${model:-?}" "${slots:-?}")")
+    done
+  fi
+  if (( enc > 0 )); then
+    echo "  SAS enclosures seen: ${enc}"
+    printf '%s\n' "${enc_lines[@]}"
+  else
+    echo "  SAS enclosures seen: 0  (/sys/class/enclosure empty or not present)"
+    echo "    If the shelf was just cabled: multipath -r, then re-run this analyze."
+  fi
+  echo "  Multipath HDD maps: ${hdd_n}"
+  echo "  Unused NVMe:        ${unused_nvme}  (one special set is 10; a second pool wants another 10)"
+  echo
+  # A populated ORCD shelf is typically 78 or 104 data HDDs. Two shelves ≈ double that.
+  if (( enc >= 2 )) || (( hdd_n >= 140 )); then
+    echo "  Second JBOD: YES — a second shelf looks installed (enclosures=${enc}, HDD maps=${hdd_n})."
+    echo "    Expect about 78 or 104 HDDs per shelf. Use one shelf per pool (data1 / data2),"
+    echo "    each with its own 10 NVMe special set. Do not stripe one pool across both shelves."
+  elif (( hdd_n >= 60 )); then
+    echo "  Second JBOD: NO — one shelf looks present (enclosures=${enc}, HDD maps=${hdd_n})."
+    echo "    Build and test data1 on this shelf first. Recheck after the second JBOD is cabled and multipath -r."
+  elif (( hdd_n > 0 )); then
+    echo "  Second JBOD: unclear — ${hdd_n} HDD map(s), ${enc} enclosure(s). Confirm cabling and multipath -r."
+  else
+    echo "  Second JBOD: no HDD maps found."
+  fi
+  echo
+
+  echo "--- Standard two-JBOD test plan (commands only; nothing is created here) ---"
+  echo "  Phase 1 — first JBOD alone (data1, 10 NVMe special):"
+  echo "    POOL=data1 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    POOL=data1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    # then the same with --draid, and with CACHE=N, and record:"
+  echo "    zpool status data1; zpool iostat -v data1 5 3"
+  echo
+  echo "  Phase 2 — second JBOD + the other 10 NVMe (data2), then compare:"
+  echo "    # after the second shelf is visible (enclosure count 2, HDD maps ~156 or ~208):"
+  echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    POOL=data2 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    # run the same client/NFS test against data1 and data2; keep the faster layout."
+  echo
+  echo "  Phase 3 — recreate both pools with the winner (destroys the test pools):"
+  echo "    POOL=data1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    POOL=data2 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
+  echo "    # create asks twice before destroying an existing same-name pool."
+  echo "    # If the shelf is 104 disks, use that count and the analyze Create: line instead of 78."
+  echo
+}
+
 run_storage_assessment() {
   local logf
   logf="${ASSESS_LOG:-/tmp/zfs-orcd-assess-$(hostname -s 2>/dev/null || hostname)-$(date +%Y%m%d-%H%M%S).log}"
@@ -2446,6 +2515,7 @@ run_storage_assessment() {
       special_fit=0
     fi
 
+    assess_print_jbod_and_test_plan "${#mpath_rows[@]}" "$unused_nvme_n"
     assess_print_special_feasibility "$unused_nvme_n" "$special_fit" "$small_n" "$large_n" "$large_sz"
 
     echo "======== RECOMMENDED DEPLOYMENTS (special vdev first) ========"

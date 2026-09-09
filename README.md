@@ -246,6 +246,18 @@ The report (also saved to `/tmp/zfs-orcd-assess-<host>-<ts>.log`) shows existing
 
 A disk counts as *unused* only if it has no filesystem, no partition table, no ZFS label, no mount and no LVM/md/LUKS holder — so the OS NVMe is never offered as SLOG/special. Multipath path slaves under a map are not treated as “in use”; those are the SAS paths, not a stacked filesystem.
 
+### Is a second JBOD present?
+
+On the storage host, as root, before running the script:
+
+```bash
+ls -d /sys/class/enclosure/*/ 2>/dev/null | wc -l
+lsscsi -g | grep -iE 'enclos|expander'
+multipath -l | grep -c SEAGATE
+```
+
+One shelf is one enclosure and about **78 or 104** multipath HDD maps. A second JBOD is a second enclosure and about **double** that count (156 or 208), after `multipath -r` if it was just cabled. Analyze prints the same verdict (`Second JBOD: YES/NO`) and a three-phase checklist: test `data1` on the first shelf with 10 NVMe, add the second shelf and the other 10 NVMe as `data2`, then recreate both pools with the faster layout. Do not put one pool across both shelves.
+
 ### Step 2 — dry run
 
 Paste the `Dry-run:` line. It performs the full discovery, prints every device per vdev and the exact shell-quoted `zpool create`, writes the log preamble, and exits **without** touching multipath configuration or creating anything. Check the layout, especially that the special mirror pairs are the intended NVMe model.
