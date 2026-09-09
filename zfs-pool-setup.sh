@@ -2259,15 +2259,19 @@ assess_print_raidz_recommended() {
 }
 
 # SAS shelf count plus a two-JBOD bring-up checklist. Read-only; does not create pools.
+# Two enclosure *devices* are normal for one dual-ported shelf (one SES LUN per HBA).
+# A second physical JBOD is extra unique HDD maps, not a second enclosure LUN.
 assess_print_jbod_and_test_plan() {
   local hdd_n=$1 unused_nvme=$2
-  local enc=0 enc_dir name vendor model slots
+  local enc=0 enc_dir name vendor model slots shelf=106
   local -a enc_lines=()
   echo "--- JBOD / second shelf ---"
-  echo "  Quick check (same facts, no script):"
-  echo "    ls -d /sys/class/enclosure/*/ 2>/dev/null | wc -l"
-  echo "    lsscsi -g | grep -iE 'enclos|expander'"
-  echo "    multipath -l | grep -c SEAGATE"
+  echo "  A second enclosure LUN is usually the second SAS path into the same shelf."
+  echo "  A second physical JBOD is extra unique HDD maps (~2× one shelf), not a second /sys enclosure."
+  echo "  Quick check:"
+  echo "    multipath -l | awk '/dm-[0-9]+/ && /SEAGATE/ && !/^ / {c++} END {print c}'"
+  echo "    lsscsi | awk '/disk/ && /SEAGATE/ {split(\$1,a,\":\"); gsub(/[[]/,\"\",a[1]); h[a[1]]++} END {for (i in h) print \"host\", i, h[i]}'"
+  echo "    sg_inq /dev/sg11; sg_inq /dev/sg124    # same serial = one chassis, two paths"
   echo
   if [[ -d /sys/class/enclosure ]]; then
     for enc_dir in /sys/class/enclosure/*; do
@@ -2279,51 +2283,52 @@ assess_print_jbod_and_test_plan() {
       model=$(tr -d ' \0' <"$enc_dir/device/model" 2>/dev/null || true)
       slots=$(ls -d "$enc_dir"/Slot* 2>/dev/null | wc -l | tr -d ' ')
       enc_lines+=("$(printf '    %s  %s %s  slots=%s' "$name" "${vendor:-?}" "${model:-?}" "${slots:-?}")")
+      # SP-34106 is a 106-bay shelf; slot count is the better per-shelf size when present.
+      if [[ "${slots:-0}" =~ ^[0-9]+$ ]] && (( slots >= 60 && (shelf == 106 || slots < shelf) )); then
+        shelf=$slots
+      fi
     done
   fi
   if (( enc > 0 )); then
-    echo "  SAS enclosures seen: ${enc}"
+    echo "  Enclosure devices (SES paths, not necessarily separate shelves): ${enc}"
     printf '%s\n' "${enc_lines[@]}"
   else
-    echo "  SAS enclosures seen: 0  (/sys/class/enclosure empty or not present)"
-    echo "    If the shelf was just cabled: multipath -r, then re-run this analyze."
+    echo "  Enclosure devices: 0  (/sys/class/enclosure empty or not present)"
   fi
-  echo "  Multipath HDD maps: ${hdd_n}"
-  echo "  Unused NVMe:        ${unused_nvme}  (one special set is 10; a second pool wants another 10)"
+  echo "  Unique multipath HDD maps: ${hdd_n}"
+  echo "  Unused NVMe:               ${unused_nvme}  (one special set is 10; a second pool wants another 10)"
   echo
-  # A populated ORCD shelf is typically 78 or 104 data HDDs. Two shelves ≈ double that.
-  if (( enc >= 2 )) || (( hdd_n >= 140 )); then
-    echo "  Second JBOD: YES — a second shelf looks installed (enclosures=${enc}, HDD maps=${hdd_n})."
-    echo "    Expect about 78 or 104 HDDs per shelf. Use one shelf per pool (data1 / data2),"
-    echo "    each with its own 10 NVMe special set. Do not stripe one pool across both shelves."
+  # One populated shelf is about 78, 104, or 106 HDDs. Two physical shelves ≈ double that.
+  # Two enclosure devices with only one shelf of maps is dual-path, not a second JBOD.
+  if (( hdd_n >= shelf + 40 )); then
+    echo "  Second JBOD: YES — ${hdd_n} unique HDD maps is more than one ${shelf}-bay shelf."
+    echo "    Use one shelf per pool (data1 / data2), each with its own 10 NVMe special set."
+    echo "    Do not stripe one pool across both shelves."
   elif (( hdd_n >= 60 )); then
-    echo "  Second JBOD: NO — one shelf looks present (enclosures=${enc}, HDD maps=${hdd_n})."
-    echo "    Build and test data1 on this shelf first. Recheck after the second JBOD is cabled and multipath -r."
+    echo "  Second JBOD: NO — ${hdd_n} unique HDD maps is one shelf (about ${shelf} bays)."
+    if (( enc >= 2 )); then
+      echo "    ${enc} enclosure devices are the two SAS paths into that same shelf, not a second box."
+      echo "    Confirm with matching serials: sg_inq on each enclosure sg device."
+    fi
+    echo "    A real second shelf adds about another ${shelf} unique maps after it is cabled and multipath -r."
+    echo "    Until that happens there are no extra HDDs for a second pool."
   elif (( hdd_n > 0 )); then
-    echo "  Second JBOD: unclear — ${hdd_n} HDD map(s), ${enc} enclosure(s). Confirm cabling and multipath -r."
+    echo "  Second JBOD: unclear — ${hdd_n} unique HDD map(s). Confirm cabling and multipath -r."
   else
     echo "  Second JBOD: no HDD maps found."
   fi
   echo
 
   echo "--- Standard two-JBOD test plan (commands only; nothing is created here) ---"
-  echo "  Phase 1 — first JBOD alone (data1, 10 NVMe special):"
-  echo "    POOL=data1 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    POOL=data1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    # then the same with --draid, and with CACHE=N, and record:"
+  echo "  Phase 1 — first shelf alone (data1, 10 NVMe special). Use the analyze Create: count, not a fixed 78."
+  echo "    POOL=data1 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
   echo "    zpool status data1; zpool iostat -v data1 5 3"
   echo
-  echo "  Phase 2 — second JBOD + the other 10 NVMe (data2), then compare:"
-  echo "    # after the second shelf is visible (enclosure count 2, HDD maps ~156 or ~208):"
-  echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    POOL=data2 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    # run the same client/NFS test against data1 and data2; keep the faster layout."
+  echo "  Phase 2 — only after unique HDD maps are about $((shelf * 2)) (second physical shelf):"
+  echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
+  echo "    # same client/NFS test on data1 and data2; keep the faster layout."
   echo
-  echo "  Phase 3 — recreate both pools with the winner (destroys the test pools):"
-  echo "    POOL=data1 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    POOL=data2 ./$(basename "$SCRIPT_PATH") --raidz3 --special=mirror5 SEAGATE 78"
-  echo "    # create asks twice before destroying an existing same-name pool."
-  echo "    # If the shelf is 104 disks, use that count and the analyze Create: line instead of 78."
+  echo "  Phase 3 — recreate both pools with the winner (create asks twice before destroying a same-name pool)."
   echo
 }
 

@@ -248,15 +248,15 @@ A disk counts as *unused* only if it has no filesystem, no partition table, no Z
 
 ### Is a second JBOD present?
 
-On the storage host, as root, before running the script:
+On the storage host, as root. Count **unique maps**, not every `multipath` line, and do not treat two enclosure devices as two shelves:
 
 ```bash
-ls -d /sys/class/enclosure/*/ 2>/dev/null | wc -l
-lsscsi -g | grep -iE 'enclos|expander'
-multipath -l | grep -c SEAGATE
+multipath -l | awk '/dm-[0-9]+/ && /SEAGATE/ && !/^ / {c++} END {print c}'
+lsscsi | awk '/disk/ && /SEAGATE/ {split($1,a,":"); gsub(/[[]/,"",a[1]); h[a[1]]++} END {for (i in h) print "host", i, h[i]}'
+sg_inq /dev/sg11; sg_inq /dev/sg124
 ```
 
-One shelf is one enclosure and about **78 or 104** multipath HDD maps. A second JBOD is a second enclosure and about **double** that count (156 or 208), after `multipath -r` if it was just cabled. Analyze prints the same verdict (`Second JBOD: YES/NO`) and a three-phase checklist: test `data1` on the first shelf with 10 NVMe, add the second shelf and the other 10 NVMe as `data2`, then recreate both pools with the faster layout. Do not put one pool across both shelves.
+One `SP-34106` shelf is **106** unique HDD maps, seen on both SAS hosts (two paths into the same disks). Two enclosure LUNs with the same `sg_inq` serial are that dual path, not a second box. A second physical JBOD adds about another 106 unique maps. `sg_ses -p 0xa` does not show slot occupancy on this firmware — both a full shelf and an empty path list the same 106 indexes with `eiioe=0`. Analyze uses the unique map count for the `Second JBOD: YES/NO` verdict.
 
 ### Step 2 — dry run
 
