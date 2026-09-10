@@ -256,7 +256,7 @@ lsscsi | awk '/disk/ && /SEAGATE/ {split($1,a,":"); gsub(/[[]/,"",a[1]); h[a[1]]
 sg_inq /dev/sg11; sg_inq /dev/sg124
 ```
 
-One `SP-34106` shelf is **106** unique HDD maps, seen on both SAS hosts (two paths into the same disks). Two enclosure LUNs with the same `sg_inq` serial are that dual path, not a second box. A second physical JBOD adds about another 106 unique maps. `sg_ses -p 0xa` does not show slot occupancy on this firmware — both a full shelf and an empty path list the same 106 indexes with `eiioe=0`. Analyze uses the unique map count for the `Second JBOD: YES/NO` verdict.
+One `SP-34106` shelf is **106** unique HDD maps, seen on both SAS hosts (two paths into the same disks). Two enclosure LUNs with the same `sg_inq` serial are that dual path, not a second box. A second physical JBOD adds about another 106 unique maps. Analyze lists every **unused** map (the second-shelf disks) after the vendor summary. If `data1` is already imported, copy/paste Create: lines use `POOL=data2`. `sg_ses -p 0xa` does not show slot occupancy on this firmware — both a full shelf and an empty path list the same 106 indexes with `eiioe=0`. Analyze uses the unique map count for the `Second JBOD: YES/NO` verdict.
 
 ### Step 2 — dry run
 

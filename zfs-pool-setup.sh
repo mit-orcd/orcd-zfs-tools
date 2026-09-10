@@ -2373,11 +2373,57 @@ assess_print_raidz_recommended() {
   done
 }
 
+assess_print_unused_hdd_maps() {
+  local row vendor product sz wwid path status n=0
+  local -a unused_lines=()
+  for row in "${mpath_rows[@]+"${mpath_rows[@]}"}"; do
+    IFS='|' read -r vendor product sz wwid path status <<<"$row"
+    [[ "$status" == unused ]] || continue
+    n=$((n + 1))
+    unused_lines+=("$(printf '    %-24s  %-10s %-18s  %s' "$wwid" "$vendor" "$product" "$(human_bytes "$sz")")")
+  done
+  echo "--- Unused HDD maps (${n} — candidates for a new pool) ---"
+  if (( n == 0 )); then
+    echo "  (none — all discovered maps are in use, labelled, or unresolved)"
+    echo
+    return 0
+  fi
+  echo "  These maps are not in a pool and have no filesystem/partition. Create mode"
+  echo "  takes matching unused maps in MPATH_SORT=${MPATH_SORT:-dm} order."
+  if ((${#unused_lines[@]} > 0)); then
+    printf '%s\n' "${unused_lines[@]}" | sort
+  fi
+  echo
+}
+
+# When data1 already exists and unused HDDs remain, analyze copy/paste lines should target data2.
+assess_suggest_second_pool() {
+  local unused=$1
+  local n has1=0 has2=0
+  local -a names=()
+  [[ "$POOL_NAME_SOURCE" == "POOL environment variable" ]] && return 0
+  (( unused >= 8 )) || return 0
+  command -v zpool >/dev/null 2>&1 || return 0
+  mapfile -t names < <(zpool list -H -o name 2>/dev/null || true)
+  for n in "${names[@]+"${names[@]}"}"; do
+    [[ "$n" == data1 ]] && has1=1
+    [[ "$n" == data2 ]] && has2=1
+  done
+  if (( has1 == 1 && has2 == 0 )); then
+    POOL=data2
+    POOL_NAME_SOURCE="data1 already exists; ${unused} unused HDD maps → data2"
+    echo "--- Next pool ---"
+    echo "  data1 is already imported. Suggested create target is data2 (${unused} unused HDD maps)."
+    echo "  Copy/paste Create: lines below use POOL=data2. Override with POOL=name if needed."
+    echo
+  fi
+}
+
 # SAS shelf count plus a two-JBOD bring-up checklist. Read-only; does not create pools.
 # Two enclosure *devices* are normal for one dual-ported shelf (one SES LUN per HBA).
 # A second physical JBOD is extra unique HDD maps, not a second enclosure LUN.
 assess_print_jbod_and_test_plan() {
-  local hdd_n=$1 unused_nvme=$2
+  local hdd_n=$1 unused_nvme=$2 unused_hdd=${3:-0}
   local enc=0 enc_dir name vendor model slots shelf=106
   local -a enc_lines=()
   echo "--- JBOD / second shelf ---"
@@ -2396,7 +2442,8 @@ assess_print_jbod_and_test_plan() {
       name=$(basename "$enc_dir")
       vendor=$(tr -d ' \0' <"$enc_dir/device/vendor" 2>/dev/null || true)
       model=$(tr -d ' \0' <"$enc_dir/device/model" 2>/dev/null || true)
-      slots=$(ls -d "$enc_dir"/Slot* 2>/dev/null | wc -l | tr -d ' ')
+      # Slot* may not exist on this SES firmware; ls+pipefail would abort the whole analyze.
+      slots=$(find "$enc_dir" -maxdepth 1 -mindepth 1 \( -iname 'slot*' -o -iname 'array device*' \) 2>/dev/null | wc -l | tr -d ' ') || slots=0
       enc_lines+=("$(printf '    %s  %s %s  slots=%s' "$name" "${vendor:-?}" "${model:-?}" "${slots:-?}")")
       # SP-34106 is a 106-bay shelf; slot count is the better per-shelf size when present.
       if [[ "${slots:-0}" =~ ^[0-9]+$ ]] && (( slots >= 60 && (shelf == 106 || slots < shelf) )); then
@@ -2410,7 +2457,7 @@ assess_print_jbod_and_test_plan() {
   else
     echo "  Enclosure devices: 0  (/sys/class/enclosure empty or not present)"
   fi
-  echo "  Unique multipath HDD maps: ${hdd_n}"
+  echo "  Unique multipath HDD maps: ${hdd_n}  (unused ${unused_hdd})"
   echo "  Unused NVMe:               ${unused_nvme}  (one special set is 10; a second pool wants another 10)"
   echo
   # One populated shelf is about 78, 104, or 106 HDDs. Two physical shelves ≈ double that.
@@ -2419,6 +2466,9 @@ assess_print_jbod_and_test_plan() {
     echo "  Second JBOD: YES — ${hdd_n} unique HDD maps is more than one ${shelf}-bay shelf."
     echo "    Use one shelf per pool (data1 / data2), each with its own 10 NVMe special set."
     echo "    Do not stripe one pool across both shelves."
+    if (( unused_hdd >= 60 )); then
+      echo "    ${unused_hdd} unused maps are the second-shelf disks for a new pool (typically ${POOL})."
+    fi
   elif (( hdd_n >= 60 )); then
     echo "  Second JBOD: NO — ${hdd_n} unique HDD maps is one shelf (about ${shelf} bays)."
     if (( enc >= 2 )); then
@@ -2435,15 +2485,21 @@ assess_print_jbod_and_test_plan() {
   echo
 
   echo "--- Standard two-JBOD test plan (commands only; nothing is created here) ---"
-  echo "  Phase 1 — first shelf alone (data1, 10 NVMe special). Use the analyze Create: count, not a fixed 78."
-  echo "    POOL=data1 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
-  echo "    zpool status data1; zpool iostat -v data1 5 3"
+  if (( unused_hdd >= 60 )) && [[ "$POOL" == data2 ]]; then
+    echo "  data1 is already present. Next step is the unused maps as data2 (${unused_hdd} free HDDs)."
+    echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${unused_hdd}"
+    echo "    zpool status data2; zpool iostat -v data2 5 3"
+  else
+    echo "  Phase 1 — first shelf alone (data1, 10 NVMe special). Use the analyze Create: count, not a fixed 78."
+    echo "    POOL=data1 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
+    echo "    zpool status data1; zpool iostat -v data1 5 3"
+    echo
+    echo "  Phase 2 — only after unique HDD maps are about $((shelf * 2)) (second physical shelf):"
+    echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
+    echo "    # same client/NFS test on data1 and data2; keep the faster layout."
+  fi
   echo
-  echo "  Phase 2 — only after unique HDD maps are about $((shelf * 2)) (second physical shelf):"
-  echo "    POOL=data2 DRY_RUN=1 ./$(basename "$SCRIPT_PATH") --draid --special=mirror3x3+1spare SEAGATE ${shelf}"
-  echo "    # same client/NFS test on data1 and data2; keep the faster layout."
-  echo
-  echo "  Phase 3 — recreate both pools with the winner (create asks twice before destroying a same-name pool)."
+  echo "  Recreate with the winner asks twice before destroying a same-name pool."
   echo
 }
 
@@ -2470,6 +2526,7 @@ run_storage_assessment() {
     large_n=0
     special_fit=0
     alias_maps=0
+    unused_hdd_n=0
     declare -A grp_count=() grp_unused=() grp_vendor=() grp_product=() grp_size=()
     declare -A nvme_sz_unused=()
     echo "================ STORAGE SERVER ANALYZE ================"
@@ -2573,6 +2630,14 @@ run_storage_assessment() {
             "${grp_unused[$key]:-0}" \
             "$status"
         done < <(printf '%s\n' "${!grp_count[@]}" | sort)
+        unused_hdd_n=0
+        if ((${#grp_unused[@]} > 0)); then
+          for key in "${!grp_unused[@]}"; do
+            unused_hdd_n=$((unused_hdd_n + grp_unused[$key]))
+          done
+        fi
+        assess_print_unused_hdd_maps
+        assess_suggest_second_pool "$unused_hdd_n"
       fi
     fi
     echo
@@ -2635,7 +2700,7 @@ run_storage_assessment() {
       special_fit=0
     fi
 
-    assess_print_jbod_and_test_plan "${#mpath_rows[@]}" "$unused_nvme_n"
+    assess_print_jbod_and_test_plan "${#mpath_rows[@]}" "$unused_nvme_n" "$unused_hdd_n"
     assess_print_special_feasibility "$unused_nvme_n" "$special_fit" "$small_n" "$large_n" "$large_sz"
 
     echo "======== RECOMMENDED DEPLOYMENTS (special vdev first) ========"
