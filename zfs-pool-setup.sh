@@ -47,12 +47,17 @@
 #   ZPOOL_FORCE=1    Pass -f to zpool create (only after reviewing the in-use pre-check output).
 #   ZFS_ATIME        atime value for the pool root dataset (default: off)
 #   ZFS_ARC_TUNE     1 (default) after a successful create: if /etc/modprobe.d/zfs.conf is absent,
-#                    write the proposed ARC sizing and apply it live. If that file already exists and
-#                    its zfs_arc_* / zfs_dirty_data_max values differ, leave it untouched and write the
-#                    proposal plus a why-it-differs note under $HOME. 0 skips. Sizing from MemTotal:
+#                    write the proposed ARC + scrub sizing and apply it live. If that file already exists
+#                    and its values differ, leave it untouched and write the proposal plus a why-it-differs
+#                    note under $HOME. 0 skips. Sizing from MemTotal:
 #   ZFS_ARC_MAX_PCT  ARC max as % of RAM (default 60; OpenZFS default is 50)
 #   ZFS_ARC_MIN_PCT  ARC min as % of RAM (default 25)
 #   ZFS_DIRTY_DATA_MAX  bytes (default 8 GiB when RAM >= 128 GiB, else ZFS default)
+#   ZFS_SCRUB_TUNE=1 (default) also writes scrub / metadata-cache tunables, each only if the host has it:
+#   ZFS_SCAN_VDEV_LIMIT      zfs_scan_vdev_limit (default 128 MiB; wide dRAID/raidz pools have few top-level vdevs)
+#   ZFS_SCRUB_MAX_ACTIVE     zfs_vdev_scrub_max_active (default 8)
+#   ZFS_ARC_DNODE_LIMIT_PCT  zfs_arc_dnode_limit_percent (default 40; 10 makes arc_prune spin on file-heavy pools)
+#   --tune           Same ARC + scrub policy as after create, without creating a pool (existing pools keep running).
 #   ORCD_BACKUP_DEST rsync destination for script + pool key after create
 #                    (default: hstor001:/data2/backup/systems/001/<hostname>/; empty string disables)
 #   SPECIAL          Y | layout name — enable special vdev. N/no/0 disables. Y = SPECIAL_NVME_COUNT NVMe as
@@ -113,12 +118,18 @@ SPECIAL_MIRROR_WAY="${SPECIAL_MIRROR_WAY:-2}"
 DESTROY_EXISTING="${DESTROY_EXISTING:-0}"
 DISCARD_NVME="${DISCARD_NVME:-1}"
 WIPE_NVME_MODE=0
+TUNE_MODE=0
 ZPOOL_FORCE="${ZPOOL_FORCE:-0}"
 HDD_SPARE_COUNT="${HDD_SPARE_COUNT:-0}"
 ZFS_ARC_TUNE="${ZFS_ARC_TUNE:-1}"
 ZFS_ARC_MAX_PCT="${ZFS_ARC_MAX_PCT:-60}"
 ZFS_ARC_MIN_PCT="${ZFS_ARC_MIN_PCT:-25}"
 ZFS_DIRTY_DATA_MAX="${ZFS_DIRTY_DATA_MAX:-}"
+# Scrub / metadata-cache tuning (written to zfs.conf with the ARC sizing; each only if the host has the parameter):
+ZFS_SCAN_VDEV_LIMIT="${ZFS_SCAN_VDEV_LIMIT:-134217728}"        # 128 MiB in flight per top-level vdev (2.1: 4M, 2.2+: 16M)
+ZFS_SCRUB_MAX_ACTIVE="${ZFS_SCRUB_MAX_ACTIVE:-8}"               # per-disk scrub queue depth (default 3)
+ZFS_ARC_DNODE_LIMIT_PCT="${ZFS_ARC_DNODE_LIMIT_PCT:-40}"        # dnode cache as % of arc_max (default 10; stops arc_prune spinning)
+ZFS_SCRUB_TUNE="${ZFS_SCRUB_TUNE:-1}"
 HDD_SPARES=()
 ZFS_ATIME="${ZFS_ATIME:-off}"
 # NVMe reserved for auxiliary vdevs: 2 for the SLOG mirror (SLOG=Y) + 2 for L2ARC (CACHE=Y).
@@ -522,6 +533,8 @@ usage() {
   echo "  -A, --analyze           Read-only analyze report (also the default when no pattern is given)"
   echo "      --assess            Alias for --analyze"
   echo "      --wipe-nvme         Discard (TRIM) every unused NVMe so it is clean for a new pool (asks twice)"
+  echo "      --tune              Apply ARC + scrub tunables without creating a pool. Writes /etc/modprobe.d/zfs.conf"
+  echo "                          only if that file is absent or already matches; otherwise writes a proposal under \$HOME"
   echo "      --topology=TYPE     Data vdev topology: draid | raidz2 | raidz3 (default: draid)"
   echo "      --draid             Same as --topology=draid"
   echo "      --raidz2            Same as --topology=raidz2 (classic parity; default ${DEFAULT_TOTAL_DISKS} → 6×13)"
@@ -692,6 +705,10 @@ parse_cli_args() {
         WIPE_NVME_MODE=1
         shift
         ;;
+      --tune)
+        TUNE_MODE=1
+        shift
+        ;;
       --draid)
         RAID_TOPOLOGY=draid
         shift
@@ -838,6 +855,17 @@ for _v in ZFS_ARC_MAX_PCT ZFS_ARC_MIN_PCT; do
   fi
 done
 unset _v
+for _v in ZFS_SCAN_VDEV_LIMIT ZFS_SCRUB_MAX_ACTIVE ZFS_ARC_DNODE_LIMIT_PCT; do
+  if ! [[ "${!_v}" =~ ^[0-9]+$ ]] || (( ${!_v} < 1 )); then
+    echo "Error: ${_v} must be a positive integer (got '${!_v}')." >&2
+    exit 1
+  fi
+done
+unset _v
+if (( ZFS_ARC_DNODE_LIMIT_PCT > 90 )); then
+  echo "Error: ZFS_ARC_DNODE_LIMIT_PCT must be <= 90 (got ${ZFS_ARC_DNODE_LIMIT_PCT})." >&2
+  exit 1
+fi
 if (( ZFS_ARC_MIN_PCT >= ZFS_ARC_MAX_PCT )); then
   echo "Error: ZFS_ARC_MIN_PCT (${ZFS_ARC_MIN_PCT}) must be below ZFS_ARC_MAX_PCT (${ZFS_ARC_MAX_PCT})." >&2
   exit 1
@@ -1695,10 +1723,23 @@ print_arc_sizing() {
     printf '  zfs_dirty_data_max: %-16s (%s async write buffer; fuller dRAID stripes per txg)  current: %s\n' "$ARC_DIRTY_B" "$(human_bytes "$ARC_DIRTY_B")" "$(arc_current_value zfs_dirty_data_max)"
   fi
   echo "  Budget left for OS/NFS/dirty data/L2ARC headers/resilver: $(human_bytes $(( ARC_MEM_B - ARC_MAX_B )))"
-  echo "  Proposed /etc/modprobe.d/zfs.conf (after create, only if that file is absent or already matches):"
+  echo "  Proposed /etc/modprobe.d/zfs.conf (after create / --tune, only if that file is absent or already matches):"
   echo "    options zfs zfs_arc_max=${ARC_MAX_B}"
   echo "    options zfs zfs_arc_min=${ARC_MIN_B}"
   (( ARC_DIRTY_B > 0 )) && echo "    options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
+  if [[ "$ZFS_SCRUB_TUNE" == "1" ]]; then
+    local t
+    echo "  Scrub / metadata-cache tuning (ZFS_SCRUB_TUNE=1; only parameters this host has):"
+    for t in "zfs_scan_vdev_limit=${ZFS_SCAN_VDEV_LIMIT}" "zfs_vdev_scrub_max_active=${ZFS_SCRUB_MAX_ACTIVE}" "zfs_arc_dnode_limit_percent=${ZFS_ARC_DNODE_LIMIT_PCT}"; do
+      if [[ -e "/sys/module/zfs/parameters/${t%%=*}" ]] || ! [[ -d /sys/module/zfs/parameters ]]; then
+        printf '    options zfs %-40s current: %s\n' "$t" "$(arc_current_value "${t%%=*}")"
+      else
+        echo "    (${t%%=*} not present on this OpenZFS — skipped)"
+      fi
+    done
+    echo "    Wide dRAID/raidz pools have few top-level vdevs, so the per-vdev scan limit caps scrub at ~1 GB/s;"
+    echo "    the dnode limit (10% of ARC) is what makes arc_prune spin on file-heavy datasets."
+  fi
   echo "  An existing zfs.conf with different values is left in place; the proposal is written under \$HOME."
   echo "  Metadata lives on the special vdev → leave zfs_arc_meta_balance default. Review arcstat l2hit% after"
   echo "  a few weeks; if L2ARC hit rate stays in single digits, repurpose the cache NVMe as hot spares."
@@ -1716,6 +1757,15 @@ arc_param_why() {
       ;;
     zfs_dirty_data_max)
       echo "8 GiB async write buffer when RAM is at least 128 GiB, so large NFS writes land as fuller data stripes per transaction group."
+      ;;
+    zfs_scan_vdev_limit)
+      echo "128 MiB of scrub/resilver I/O in flight per top-level vdev (OpenZFS default is 4–16 MiB). Wide dRAID/raidz pools have few vdevs, so the default caps scrub near 1 GB/s."
+      ;;
+    zfs_vdev_scrub_max_active)
+      echo "per-disk scrub queue depth (OpenZFS default 3); 8 keeps more outstanding I/O on each HDD during scrub."
+      ;;
+    zfs_arc_dnode_limit_percent)
+      echo "${ZFS_ARC_DNODE_LIMIT_PCT}% of arc_max for the dnode cache (OpenZFS default 10). File-heavy datasets with dnodesize=auto hit the 10% cap during scrub and arc_prune spins."
       ;;
     *)
       echo "proposed by this script from host RAM"
@@ -1773,17 +1823,80 @@ arc_proposal_home() {
   echo /tmp
 }
 
+arc_host_has_param() {
+  local name=$1
+  [[ ! -d /sys/module/zfs/parameters ]] && return 0
+  [[ -e "/sys/module/zfs/parameters/$name" ]]
+}
+
+arc_proposed_value() {
+  case "$1" in
+    zfs_arc_max) echo "$ARC_MAX_B" ;;
+    zfs_arc_min) echo "$ARC_MIN_B" ;;
+    zfs_dirty_data_max) echo "$ARC_DIRTY_B" ;;
+    zfs_scan_vdev_limit) echo "$ZFS_SCAN_VDEV_LIMIT" ;;
+    zfs_vdev_scrub_max_active) echo "$ZFS_SCRUB_MAX_ACTIVE" ;;
+    zfs_arc_dnode_limit_percent) echo "$ZFS_ARC_DNODE_LIMIT_PCT" ;;
+    *) echo "" ;;
+  esac
+}
+
+arc_fmt_conf_value() { # $1 key $2 value — human-readable for the proposal note
+  case "$1" in
+    zfs_arc_max | zfs_arc_min | zfs_dirty_data_max | zfs_scan_vdev_limit)
+      echo "$2 ($(human_bytes "$2"))"
+      ;;
+    *)
+      echo "$2"
+      ;;
+  esac
+}
+
+arc_key_in() {
+  local needle=$1 x
+  shift
+  for x in "$@"; do
+    [[ "$x" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+arc_fill_proposed_keys() {
+  local name
+  proposed_keys=(zfs_arc_max zfs_arc_min)
+  (( ARC_DIRTY_B > 0 )) && proposed_keys+=(zfs_dirty_data_max)
+  if [[ "$ZFS_SCRUB_TUNE" == "1" ]]; then
+    for name in zfs_scan_vdev_limit zfs_vdev_scrub_max_active zfs_arc_dnode_limit_percent; do
+      if arc_host_has_param "$name"; then
+        proposed_keys+=("$name")
+      fi
+    done
+  fi
+}
+
 # Write the proposed modprobe snippet (no comparison header) to stdout.
 arc_proposed_options() {
+  local t name
   echo "options zfs zfs_arc_max=${ARC_MAX_B}"
   echo "options zfs zfs_arc_min=${ARC_MIN_B}"
   if (( ARC_DIRTY_B > 0 )); then
     echo "options zfs zfs_dirty_data_max=${ARC_DIRTY_B}"
   fi
+  if [[ "$ZFS_SCRUB_TUNE" == "1" ]]; then
+    echo "# scrub / metadata-cache tuning (only parameters present on this host at write time)"
+    for t in "zfs_scan_vdev_limit=${ZFS_SCAN_VDEV_LIMIT}" "zfs_vdev_scrub_max_active=${ZFS_SCRUB_MAX_ACTIVE}" "zfs_arc_dnode_limit_percent=${ZFS_ARC_DNODE_LIMIT_PCT}"; do
+      name="${t%%=*}"
+      if [[ -e "/sys/module/zfs/parameters/$name" ]] || [[ ! -d /sys/module/zfs/parameters ]]; then
+        echo "options zfs ${t}"
+      else
+        echo "# ${name} not present on this OpenZFS at write time — skipped"
+      fi
+    done
+  fi
 }
 
 arc_apply_live() {
-  local p
+  local p t
   for p in "zfs_arc_max=${ARC_MAX_B}" "zfs_arc_min=${ARC_MIN_B}"; do
     if [[ -w "/sys/module/zfs/parameters/${p%%=*}" ]]; then
       echo "${p#*=}" >"/sys/module/zfs/parameters/${p%%=*}" 2>/dev/null && echo "Applied live: ${p}" || echo "Warning: could not apply ${p} live (takes effect after reboot)." >&2
@@ -1793,6 +1906,17 @@ arc_apply_live() {
     if echo "$ARC_DIRTY_B" >/sys/module/zfs/parameters/zfs_dirty_data_max 2>/dev/null; then
       echo "Applied live: zfs_dirty_data_max=${ARC_DIRTY_B}"
     fi
+  fi
+  if [[ "$ZFS_SCRUB_TUNE" == "1" ]]; then
+    for t in "zfs_scan_vdev_limit=${ZFS_SCAN_VDEV_LIMIT}" "zfs_vdev_scrub_max_active=${ZFS_SCRUB_MAX_ACTIVE}" "zfs_arc_dnode_limit_percent=${ZFS_ARC_DNODE_LIMIT_PCT}"; do
+      if [[ -w "/sys/module/zfs/parameters/${t%%=*}" ]]; then
+        if echo "${t#*=}" >"/sys/module/zfs/parameters/${t%%=*}" 2>/dev/null; then
+          echo "Applied live: ${t}"
+        else
+          echo "Warning: could not apply ${t} live (takes effect after reboot)." >&2
+        fi
+      fi
+    done
   fi
 }
 
@@ -1811,8 +1935,7 @@ apply_arc_sizing() {
     return 0
   fi
 
-  proposed_keys=(zfs_arc_max zfs_arc_min)
-  (( ARC_DIRTY_B > 0 )) && proposed_keys+=(zfs_dirty_data_max)
+  arc_fill_proposed_keys
 
   if [[ ! -e "$conf" ]]; then
     ts=$(date +%Y%m%d-%H%M%S)
@@ -1832,11 +1955,7 @@ apply_arc_sizing() {
   arc_parse_conf_params "$conf"
   for key in "${proposed_keys[@]}"; do
     have="${ARC_CONF_PARAMS[$key]:-}"
-    case "$key" in
-      zfs_arc_max) need=$ARC_MAX_B ;;
-      zfs_arc_min) need=$ARC_MIN_B ;;
-      zfs_dirty_data_max) need=$ARC_DIRTY_B ;;
-    esac
+    need=$(arc_proposed_value "$key")
     if [[ -z "$have" || "$have" != "$need" ]]; then
       need_update=1
     fi
@@ -1865,18 +1984,14 @@ apply_arc_sizing() {
     echo "# What differs, and why:"
     for key in "${proposed_keys[@]}"; do
       have="${ARC_CONF_PARAMS[$key]:-}"
-      case "$key" in
-        zfs_arc_max) need=$ARC_MAX_B ;;
-        zfs_arc_min) need=$ARC_MIN_B ;;
-        zfs_dirty_data_max) need=$ARC_DIRTY_B ;;
-      esac
+      need=$(arc_proposed_value "$key")
       echo "#   ${key}"
       if [[ -z "$have" ]]; then
         echo "#     existing:  (not set in ${conf})"
       else
-        echo "#     existing:  ${have} ($(human_bytes "$have"))"
+        echo "#     existing:  $(arc_fmt_conf_value "$key" "$have")"
       fi
-      echo "#     proposed:  ${need} ($(human_bytes "$need"))"
+      echo "#     proposed:  $(arc_fmt_conf_value "$key" "$need")"
       if [[ -z "$have" ]]; then
         echo "#     change:    add — $(arc_param_why "$key")"
       elif [[ "$have" == "$need" ]]; then
@@ -1888,9 +2003,9 @@ apply_arc_sizing() {
     local extra=0
     if ((${#ARC_CONF_PARAMS[@]} > 0)); then
       for key in "${!ARC_CONF_PARAMS[@]}"; do
-        case "$key" in
-          zfs_arc_max | zfs_arc_min | zfs_dirty_data_max) continue ;;
-        esac
+        if arc_key_in "$key" "${proposed_keys[@]}"; then
+          continue
+        fi
         if (( extra == 0 )); then
           echo "#"
           echo "# Other options zfs settings in the existing file (copied below so a reviewed install does not drop them):"
@@ -1902,9 +2017,9 @@ apply_arc_sizing() {
     echo
     arc_proposed_options
     for key in "${!ARC_CONF_PARAMS[@]}"; do
-      case "$key" in
-        zfs_arc_max | zfs_arc_min | zfs_dirty_data_max) continue ;;
-      esac
+      if arc_key_in "$key" "${proposed_keys[@]}"; then
+        continue
+      fi
       echo "options zfs ${key}=${ARC_CONF_PARAMS[$key]}"
     done
   } >"$dest" || { echo "Warning: could not write proposed ARC file under ${home}." >&2; return 0; }
@@ -2786,6 +2901,21 @@ run_storage_assessment() {
   echo
   echo "Analyze log: $logf"
 }
+
+# --- Standalone tuning mode: ARC sizing + scrub/metadata tunables for the running host ---
+if (( TUNE_MODE )); then
+  if (( EUID != 0 )); then
+    echo "Error: --tune must run as root." >&2
+    exit 1
+  fi
+  print_arc_sizing
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "DRY_RUN=1 — nothing written or applied."
+    exit 0
+  fi
+  apply_arc_sizing
+  exit 0
+fi
 
 # --- Standalone NVMe wipe mode ---
 if (( WIPE_NVME_MODE )); then

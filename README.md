@@ -306,13 +306,23 @@ The analyze report shows the current naming mode (`Map naming: WWID` or `mpathX 
 
 ### ARC sizing
 
-The analyze report prints an **ARC sizing** block computed from the host's `MemTotal`. After a successful create, that proposal is written to `/etc/modprobe.d/zfs.conf` only when the file is **absent**. If the file already exists and its `zfs_arc_max` / `zfs_arc_min` / `zfs_dirty_data_max` values differ, the script leaves it untouched, does not change live `/sys` parameters, and writes the proposal plus a line-by-line comparison (what changed, and why) under `$HOME` as `zfs.conf.proposed-<host>-<timestamp>`. If the existing file already has the proposed values, it is left as-is and those values are applied live.
+The analyze report prints an **ARC sizing** block computed from the host's `MemTotal`. After a successful create (or `--tune`), that proposal is written to `/etc/modprobe.d/zfs.conf` only when the file is **absent** or already matches. If the file already exists and its values differ, the script leaves it untouched, does not change live `/sys` parameters, and writes the proposal plus a line-by-line comparison (what changed, and why) under `$HOME` as `zfs.conf.proposed-<host>-<timestamp>`. If the existing file already has the proposed values, it is left as-is and those values are applied live.
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
 | `zfs_arc_max` | 60% of RAM (`ZFS_ARC_MAX_PCT`) | A little above the OpenZFS default of 50%; the remaining ~40% covers OS/NFS daemons, dirty data, L2ARC headers (~70 B per cached record, held in ARC), resilver headroom and any co-located services. |
 | `zfs_arc_min` | 25% of RAM (`ZFS_ARC_MIN_PCT`) | Floor so the ARC is not squeezed away under transient pressure, while leaving room for the OOM-safe worst case. |
 | `zfs_dirty_data_max` | 8 GiB when RAM ≥ 128 GiB (`ZFS_DIRTY_DATA_MAX`) | Larger write buffer so big NFS writes land as fuller 12-disk dRAID stripes per transaction group. |
+
+The same file also carries scrub / metadata-cache tuning (`ZFS_SCRUB_TUNE=1`), each line written and applied only if the running OpenZFS has the parameter:
+
+| Parameter | Default | Why |
+|-----------|---------|-----|
+| `zfs_scan_vdev_limit` | 128 MiB (`ZFS_SCAN_VDEV_LIMIT`) | Scrub/resilver I/O in flight **per top-level vdev** (OpenZFS default 4 MiB on 2.1, 16 MiB on 2.2+). A 104-HDD pool built as 4 × 26-wide dRAID has only four top-level vdevs, so the default caps a scrub near 1 GB/s regardless of disk count. |
+| `zfs_vdev_scrub_max_active` | 8 (`ZFS_SCRUB_MAX_ACTIVE`) | Per-disk scrub queue depth (default 3). |
+| `zfs_arc_dnode_limit_percent` | 40 (`ZFS_ARC_DNODE_LIMIT_PCT`) | Dnode cache as % of `arc_max` (default 10). On file-heavy datasets — especially with `dnodesize=auto` — the 10 % limit is hit during scrubs and the `arc_prune` kernel thread spins at high CPU. |
+
+To apply the ARC + scrub tuning to a host whose pool already exists, run `./zfs-pool-setup.sh --tune` (`DRY_RUN=1` shows the values first). It uses the same non-clobber policy as after create.
 
 For a 250 GB node that is about `zfs_arc_max` ≈ 140 GiB and `zfs_arc_min` ≈ 58 GiB (values are rounded down to whole GiB from the actual `MemTotal`). `ZFS_ARC_TUNE=0` skips both the system file and the `$HOME` proposal. Run `dracut -f` afterwards only if you install a new `zfs.conf` and the zfs module is in the initramfs. Metadata sits on the special vdev, so leave `zfs_arc_meta_balance` at its default; check `arcstat` `l2hit%` after a few weeks and repurpose the L2ARC NVMe as hot spares if it stays in single digits.
 
@@ -379,6 +389,7 @@ Constraint: `(C − S)` must be a multiple of `(D + P)`; here (26 − 2) / 12 = 
 | `HDD_SPARE_COUNT=N` | Extra matched HDDs (taken after the data disks) added as pool hot spares. |
 | `DRAID_MAX_WIDTH=N` | Widest vdev analyze will propose (default 40). |
 | `ZFS_ARC_TUNE=1\|0`, `ZFS_ARC_MAX_PCT`, `ZFS_ARC_MIN_PCT`, `ZFS_DIRTY_DATA_MAX` | After create, write ARC sizing to `/etc/modprobe.d/zfs.conf` only if that file is absent (defaults 1 / 60 / 25 / 8 GiB). A differing existing file is left alone; the proposal and the comparison go to `$HOME/zfs.conf.proposed-<host>-<ts>`. |
+| `--tune`, `ZFS_SCRUB_TUNE=1\|0`, `ZFS_SCAN_VDEV_LIMIT`, `ZFS_SCRUB_MAX_ACTIVE`, `ZFS_ARC_DNODE_LIMIT_PCT` | Scrub / dnode-cache tuning in the same file (128 MiB / 8 / 40); `--tune` applies ARC + scrub tunables on a running host using the same non-clobber policy. |
 | `DRY_RUN=1` | Discovery + command + log only. |
 | `POOL=name` | Pool name (default from hostname rule above; always verified interactively). |
 | `SKIP_CONFIRM=1` | No interactive prompts (pool-name verification and the final zpool create confirmation). |
