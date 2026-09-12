@@ -74,6 +74,9 @@
 #   SPECIAL_VDEV     Same as SPECIAL when set to a layout name; overrides SPECIAL=Y default.
 #   SPECIAL_PATTERN  Optional substring filter for NVMe chosen as special (default: largest unused after log/cache).
 #   DRY_RUN=1        Print discovery, layout, command, and log preamble only (no mpathconf / zpool create)
+#   CHECK_EXPORTED=1  Also scan disks with `zpool import` for an exported same-name pool. Off by default:
+#                    that scan walks every HDD and can sit for minutes (or hang on a bad SAS path) after
+#                    "Using pool name". Imported pools are still detected; leftover labels are caught later.
 #   MPATH_SORT       dm (default: order by dm-N, like `multipath -l | sort -t- -k2 -n`) | wwid
 #   MPATH_SORT_CMD   Advanced: replace the sort with a pipeline applied to "WWID dm-N alias" rows.
 #   MPATH_DEV_DIR    Device dir used to resolve/verify multipath members (default /dev/mapper)
@@ -86,7 +89,10 @@
 #   MPATH_USER_FRIENDLY_NAMES=1  Allow mpathX aliases to remain (skip mpathconf; members then go via
 #                                /dev/disk/by-id/dm-uuid-mpath-<WWID>). NOT recommended — ORCD pools use WWID names.
 #
-# Special vdev (mpath pools only): four smallest unused NVMe → log+cache; largest remainder → special.
+# Special vdev (mpath pools only): smallest unused NVMe → log+cache; remaining largest-tier → special.
+#   SPECIAL_NUMA=1 (default) packs special/spare NVMe onto the pool's CPU socket (package), not a
+#   single NUMA node. Dual-socket Xeon with SNC shows 4 NUMA nodes: 0+1 = socket 0, 2+3 = socket 1.
+#   data1 → socket 0, data2 → socket 1. SPECIAL_NUMA=0 is size+path (legacy).
 #   Run with --help-special for layout choices. Losing the entire special vdev loses the pool — use mirrors in prod.
 #
 set -euo pipefail
@@ -115,6 +121,9 @@ CACHE="${CACHE:-Y}"
 [[ "$SKIP_LOG_CACHE" == "1" ]] && { SLOG=N; CACHE=N; }
 SPECIAL_NVME_COUNT="${SPECIAL_NVME_COUNT:-10}"
 SPECIAL_MIRROR_WAY="${SPECIAL_MIRROR_WAY:-2}"
+SPECIAL_NUMA="${SPECIAL_NUMA:-1}"
+SPECIAL_NUMA_NODE="${SPECIAL_NUMA_NODE:-}"
+SPECIAL_NUMA_SOCKET="${SPECIAL_NUMA_SOCKET:-}"
 DESTROY_EXISTING="${DESTROY_EXISTING:-0}"
 DISCARD_NVME="${DISCARD_NVME:-1}"
 WIPE_NVME_MODE=0
@@ -229,7 +238,17 @@ existing_pool_state() { # $1 pool → "imported" | "exported" | ""
   command -v zpool >/dev/null 2>&1 || return 0
   if zpool list -H -o name 2>/dev/null | grep -qx -- "$1"; then
     echo imported
-  elif zpool import 2>/dev/null | awk '$1 == "pool:" {print $2}' | grep -qx -- "$1"; then
+    return 0
+  fi
+  # Bare `zpool import` reads labels on every disk. On a 200-HDD dual-JBOD that can take
+  # minutes or hang on a bad SAS path — looks stuck right after "Using pool name".
+  # Skip unless CHECK_EXPORTED=1. Imported pools are covered above; device in-use checks
+  # still refuse leftover ZFS labels on the disks chosen for the new pool.
+  if [[ "${CHECK_EXPORTED:-0}" != "1" ]]; then
+    return 0
+  fi
+  echo "Scanning disks for exported pool '${1}' (zpool import; can take minutes on a large JBOD)…" >&2
+  if zpool import 2>/dev/null | awk '$1 == "pool:" {print $2}' | grep -qx -- "$1"; then
     echo exported
   fi
 }
@@ -508,9 +527,13 @@ Replication-level note: OpenZFS refuses "draidN + lower-redundancy special" with
   replication level). The script adds -f automatically for that case - expected, not an error. The
   in-use safety check runs before zpool create regardless of -f.
 
-Discovery (DATA_DISK_SOURCE=mpath):
+  Discovery (DATA_DISK_SOURCE=mpath):
   - smallest unused whole-disk NVMe -> SLOG mirror / L2ARC (per SLOG / CACHE)
-  - largest remaining NVMe (optionally filtered by SPECIAL_PATTERN) -> special vdev (+ pool spares per layout)
+  - remaining largest-tier NVMe (optionally SPECIAL_PATTERN) -> special vdev (+ pool spares per layout)
+    SPECIAL_NUMA=1 (default): pack onto the pool's CPU socket (package). Dual-socket + SNC is 4 NUMA
+    nodes (0+1 = socket 0, 2+3 = socket 1). data1 prefers socket 0, data2 prefers socket 1, then NUMA
+    node and PCI. SPECIAL_NUMA=0 is size then by-id path (legacy). SPECIAL_NUMA_SOCKET=0|1 or
+    SPECIAL_NUMA_NODE=N override.
 
 Aliases: default | recommended -> derived from SPECIAL_NVME_COUNT/SPECIAL_MIRROR_WAY; conservative -> mirror5;
          staged -> mirror8; mirror9 -> mirror9+2spare; raidz2 -> raidz2x10; raidz3 -> raidz3x20; raidz2-18 -> raidz2-18+2spare
@@ -550,6 +573,7 @@ usage() {
   echo "Key env: DATA_DISK_SOURCE=mpath|nvme  RAID_TOPOLOGY=draid|raidz2|raidz3  DRAID_PARITY=2|3"
   echo "         DRAID_PROFILE=balanced|capacity  DRAID_MIN_SPARES=0..2"
   echo "         SPECIAL=Y|layout  SPECIAL_NVME_COUNT=N  SPECIAL_MIRROR_WAY=2|3  SPECIAL_PATTERN=substring  DRY_RUN=1"
+  echo "         SPECIAL_NUMA=1|0  SPECIAL_NUMA_SOCKET=0|1  SPECIAL_NUMA_NODE=N"
   echo "         SLOG=Y|N  CACHE=Y|N  DESTROY_EXISTING=1 (with SKIP_CONFIRM=1: destroy same-name pool non-interactively)"
   echo "         DISKS_PER_VDEV=N  HDD_SPARE_COUNT=N  DRAID_VDEV_SPEC=draidP:Dd:Cc:Ss  ZPOOL_FORCE=1  SKIP_CONFIRM=1"
   echo "By default a create run applies: mpathconf --enable --user_friendly_names n (unless"
@@ -1086,6 +1110,23 @@ collect_multipath_wwids_all() {
   fi
 }
 
+# True if this map may be a member of a *new* pool. Same unused rule as analyze (no ZFS label,
+# filesystem, partition, mount, or stacked holder). Members of a pool scheduled for destroy are
+# allowed so a same-name recreate can proceed. Other imported pools (data1 when creating data2)
+# are skipped — taking "first N of all matches" would steal those disks.
+mpath_wwid_is_available() {
+  local wwid=$1 path real reason
+  path=$(resolve_mpath_device "$wwid" 2>/dev/null) || return 1
+  real=$(readlink -f "$path" 2>/dev/null || echo "$path")
+  if [[ -n "${DESTROY_MEMBERS[$real]:-}" ]]; then
+    return 0
+  fi
+  if reason=$(device_in_use_reason "$path"); then
+    return 0
+  fi
+  return 1
+}
+
 # Aliases still active? Returns the count (0 = all WWID-named).
 count_multipath_alias_maps() {
   collect_multipath_maps_matching | awk '$3 != "-"' | wc -l | tr -d ' '
@@ -1212,6 +1253,172 @@ nvme_by_id_better() { # $1 candidate, $2 current best → true if candidate pref
   [[ "$1" < "$2" ]]
 }
 
+# Sysfs helpers for NUMA / PCI placement (special vdev). Missing or -1 → unknown.
+nvme_block_sysfs() {
+  local real
+  real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+  echo "/sys/class/block/$(basename "$real")"
+}
+
+nvme_controller_name() {
+  local real base
+  real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+  base=$(basename "$real")
+  if [[ "$base" =~ ^(nvme[0-9]+)n[0-9]+$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
+}
+
+nvme_numa_node() {
+  local dev=$1 sys ctrl f node
+  sys=$(nvme_block_sysfs "$dev")
+  for f in "$sys/device/numa_node" "$sys/device/device/numa_node"; do
+    [[ -r "$f" ]] || continue
+    node=$(tr -d '[:space:]' <"$f" 2>/dev/null || true)
+    [[ "$node" =~ ^[0-9]+$ ]] && { echo "$node"; return; }
+  done
+  ctrl=$(nvme_controller_name "$dev")
+  if [[ -n "$ctrl" ]]; then
+    for f in "/sys/class/nvme/${ctrl}/numa_node" "/sys/class/nvme/${ctrl}/device/numa_node"; do
+      [[ -r "$f" ]] || continue
+      node=$(tr -d '[:space:]' <"$f" 2>/dev/null || true)
+      [[ "$node" =~ ^[0-9]+$ ]] && { echo "$node"; return; }
+    done
+  fi
+  echo -1
+}
+
+nvme_pci_addr() {
+  local sys p i base
+  sys=$(nvme_block_sysfs "$1")
+  p=$(readlink -f "$sys/device" 2>/dev/null || true)
+  for ((i = 0; i < 12 && -n "$p"; i++)); do
+    base=$(basename "$p")
+    if [[ "$base" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+      echo "$base"
+      return
+    fi
+    p=$(readlink -f "$p/.." 2>/dev/null || true)
+  done
+  echo "-"
+}
+
+nvme_place_brief() {
+  local node pkg
+  node=$(nvme_numa_node "$1")
+  pkg=$(numa_node_package "$node")
+  if [[ "$pkg" != -1 ]]; then
+    printf 'numa %s/pkg%s  %s' "$node" "$pkg" "$(nvme_pci_addr "$1")"
+  else
+    printf 'numa %s  %s' "$node" "$(nvme_pci_addr "$1")"
+  fi
+}
+
+host_numa_node_count() {
+  local n=0 d
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "$d" ]] || continue
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# physical_package_id (CPU socket) for a NUMA node. SNC: node0+1 → pkg0, node2+3 → pkg1.
+# If sysfs is missing, split the node id range across two sockets (4 nodes → 0,1 vs 2,3).
+numa_node_package() {
+  local node=$1 cpu f pkg ncount
+  [[ "$node" =~ ^[0-9]+$ ]] || { echo -1; return; }
+  f="/sys/devices/system/node/node${node}/cpulist"
+  if [[ -r "$f" ]]; then
+    cpu=$(tr -d '[:space:]' <"$f" | cut -d',' -f1 | cut -d'-' -f1)
+    if [[ -n "$cpu" && -r "/sys/devices/system/cpu/cpu${cpu}/topology/physical_package_id" ]]; then
+      pkg=$(tr -d '[:space:]' <"/sys/devices/system/cpu/cpu${cpu}/topology/physical_package_id" 2>/dev/null || true)
+      [[ "$pkg" =~ ^[0-9]+$ ]] && { echo "$pkg"; return; }
+    fi
+  fi
+  ncount=$(host_numa_node_count)
+  if (( ncount >= 2 )); then
+    echo $((node * 2 / ncount))
+    return
+  fi
+  echo -1
+}
+
+numa_nodes_on_package() {
+  local pkg=$1 d node p
+  local -a out=()
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "$d" ]] || continue
+    node=${d##*node}
+    p=$(numa_node_package "$node")
+    [[ "$p" == "$pkg" ]] && out+=("$node")
+  done
+  (IFS=,; echo "${out[*]}")
+}
+
+# Preferred CPU socket (package) for this pool's special set: data1→0, data2→1.
+special_preferred_package() {
+  if [[ -n "${SPECIAL_NUMA_SOCKET}" ]]; then
+    echo "$SPECIAL_NUMA_SOCKET"
+    return
+  fi
+  if [[ -n "${SPECIAL_NUMA_NODE}" ]]; then
+    numa_node_package "$SPECIAL_NUMA_NODE"
+    return
+  fi
+  case "${POOL}" in
+    data1) echo 0 ;;
+    data2) echo 1 ;;
+  esac
+}
+
+# Sort rank: 0 = preferred socket (or exact SPECIAL_NUMA_NODE), 1 = sibling SNC node on that
+# socket when a specific node was requested, 10 = other socket, 50 = unknown.
+nvme_special_numa_rank() {
+  local path=$1 preferred_pkg=$2 node pkg
+  node=$(nvme_numa_node "$path")
+  if [[ "$node" == -1 ]]; then
+    echo 50
+    return
+  fi
+  pkg=$(numa_node_package "$node")
+  if [[ -n "${SPECIAL_NUMA_NODE}" ]]; then
+    if [[ "$node" == "${SPECIAL_NUMA_NODE}" ]]; then
+      echo 0
+    elif [[ "$pkg" != -1 && "$pkg" == "$(numa_node_package "${SPECIAL_NUMA_NODE}")" ]]; then
+      echo 1
+    else
+      echo 10
+    fi
+    return
+  fi
+  if [[ -z "$preferred_pkg" ]]; then
+    [[ "$pkg" == -1 ]] && echo "$node" || echo "$pkg"
+    return
+  fi
+  if [[ "$pkg" == "$preferred_pkg" ]]; then
+    echo 0
+  elif [[ "$pkg" == -1 ]]; then
+    echo 50
+  else
+    echo 10
+  fi
+}
+
+assess_print_numa_topology() {
+  local ncount node d p
+  ncount=$(host_numa_node_count)
+  (( ncount > 0 )) || return 0
+  echo "  CPU topology: ${ncount} NUMA node(s). Dual-socket Xeon with SNC is typically 4"
+  echo "    (node0+1 = socket 0, node2+3 = socket 1). Special: data1 → socket 0, data2 → socket 1."
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "$d" ]] || continue
+    node=${d##*node}
+    p=$(numa_node_package "$node")
+    printf '    NUMA node%s → CPU socket/package %s\n' "$node" "$p"
+  done
+}
+
 # Pick one stable by-id symlink per backing device (nvme-<Model>_<SN> preferred over nvme-eui.*).
 pick_unique_nvme_by_id_paths() {
   declare -A best_id_for_real=()
@@ -1333,17 +1540,37 @@ discover_nvme_aux_vdevs() {
     echo "Note: ${n} NVMe available — ${AUX_NVME_COUNT} reserved for log+cache, ${nvme_total} largest eligible for special tier (${SPECIAL_LAYOUT}: ${special_count} special + ${spare_count} pool spare)." >&2
   fi
 
-  # Candidates after the log/cache reservation, filtered by SPECIAL_PATTERN, largest first. Keep the
-  # size-descending order (then path) so mirror pairs are formed from equally sized disks.
+  # SPECIAL_NUMA=1 (default): size, then pack onto the pool's CPU socket, then NUMA node, then PCI.
+  # SPECIAL_NUMA=0: size then by-id path (legacy).
+  local preferred_pkg="" numa_rank pci node_id
+  if [[ "${SPECIAL_NUMA}" == "1" ]]; then
+    preferred_pkg=$(special_preferred_package)
+    if [[ -n "$preferred_pkg" ]]; then
+      echo "Note: special NVMe placement SPECIAL_NUMA=1, preferred CPU socket/package ${preferred_pkg} (pool ${POOL}; NUMA nodes $(numa_nodes_on_package "$preferred_pkg")). SPECIAL_NUMA=0 restores size+path order." >&2
+    else
+      echo "Note: special NVMe placement SPECIAL_NUMA=1, no pool-specific socket (sort by package, then NUMA, then PCI)." >&2
+    fi
+  fi
   mapfile -t tier_rows < <(
     printf '%s\n' "${sorted_asc[@]:AUX_NVME_COUNT}" |
       while IFS= read -r row; do
         [[ -z "$row" ]] && continue
         read -r sz path <<<"$row"
         nvme_path_matches_special_pattern "$path" || continue
-        echo "$row"
+        if [[ "${SPECIAL_NUMA}" == "1" ]]; then
+          numa_rank=$(nvme_special_numa_rank "$path" "$preferred_pkg")
+          node_id=$(nvme_numa_node "$path")
+          pci=$(nvme_pci_addr "$path")
+          printf '%s %s %s %s %s\n' "$sz" "$numa_rank" "$node_id" "$pci" "$path"
+        else
+          printf '%s %s\n' "$sz" "$path"
+        fi
       done |
-      sort -k1,1nr -k2,2 |
+      if [[ "${SPECIAL_NUMA}" == "1" ]]; then
+        sort -k1,1nr -k2,2n -k3,3n -k4,4 -k5,5 | awk '{print $1, $5}'
+      else
+        sort -k1,1nr -k2,2
+      fi |
       head -n "$nvme_total"
   )
 
@@ -1373,6 +1600,21 @@ discover_nvme_aux_vdevs() {
     read -r sz f <<<"$row"
     NVME_POOL_SPARE+=("$f")
   done
+
+  if [[ "${SPECIAL_NUMA}" == "1" ]] && ((${#NVME_SPECIAL[@]} > 0)); then
+    declare -A _nn_count=()
+    local _nd _d
+    for _d in "${NVME_SPECIAL[@]}" ${NVME_POOL_SPARE[@]+"${NVME_POOL_SPARE[@]}"}; do
+      _nd=$(nvme_numa_node "$_d")
+      _nn_count[$_nd]=$((${_nn_count[$_nd]:-0} + 1))
+    done
+    echo -n "Note: special/spare NVMe by NUMA:" >&2
+    for _nd in $(printf '%s\n' "${!_nn_count[@]}" | sort -n); do
+      echo -n "  node ${_nd}=${_nn_count[$_nd]}" >&2
+    done
+    echo >&2
+    unset _nn_count _nd _d
+  fi
 
   # Mixed sizes inside the special tier: warn (mirrors/raidz are capped at the smallest member).
   if ((${#special_sizes[@]} > 1)) && [[ "${special_sizes[0]}" != "${special_sizes[-1]}" ]]; then
@@ -1575,7 +1817,7 @@ print_visual_pool_layout() {
     i=0
     for d in "${NVME_SPECIAL[@]}"; do
       ((++i))
-      printf '  [%2d] %-45s (%s)\n' "$i" "$(vdev_name "$d")" "$d"
+      printf '  [%2d] %-45s (%s)  [%s]\n' "$i" "$(vdev_name "$d")" "$d" "$(nvme_place_brief "$d")"
     done
     echo
   fi
@@ -2229,9 +2471,70 @@ assess_candidate_layouts() {
   printf '%s\n' ${out[@]+"${out[@]}"}
 }
 
+# How many largest-tier NVMe remain for special after reserving $aux smallest for SLOG/L2ARC.
+# aux=4 → SLOG+L2ARC; aux=2 → SLOG only (CACHE=N). Small disks cover aux when there are enough of them.
+assess_nvme_special_fit() {
+  local unused=$1 small_n=$2 large_n=$3 large_sz=$4 small_sz=$5 aux=$6
+  if (( unused < aux + 2 )); then
+    echo 0
+    return
+  fi
+  if (( large_sz != small_sz )); then
+    if (( small_n >= aux )); then
+      echo "$large_n"
+    else
+      echo $((unused - aux))
+    fi
+  else
+    echo $((unused - aux))
+  fi
+}
+
+# Default 2-way and 3-way layout names that fit in $1 eligible NVMe (two lines).
+assess_default_mirror_layouts() {
+  local fit=$1
+  local d2="" d3=""
+  local -a cand=()
+  if (( fit >= 2 )); then
+    mapfile -t cand < <(assess_candidate_layouts "$fit")
+    if ((${#cand[@]} > 0)) && [[ -n "${cand[0]:-}" ]]; then
+      d2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
+      d3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
+      if [[ -n "$d2" ]] && (( $(special_layout_nvme_total "$d2" 2>/dev/null || echo 999) > fit )); then
+        d2=""
+      fi
+      if [[ -n "$d3" ]] && (( $(special_layout_nvme_total "$d3" 2>/dev/null || echo 999) > fit )); then
+        d3=""
+      fi
+      if [[ -z "$d2" && -z "$d3" ]]; then
+        d2=$(special_layout_from_count "$fit" 2 2>/dev/null || true)
+        d3=$(special_layout_from_count "$fit" 3 2>/dev/null || true)
+      fi
+    fi
+  fi
+  printf '%s\n' "$d2"
+  printf '%s\n' "$d3"
+}
+
+assess_print_special_layout_list() {
+  local label=$1 fit=$2 aux=$3
+  local layout nvme_n need
+  if (( fit < 2 )); then
+    echo "  Special vdev (${label}): NO layout fits after reserving ${aux} NVMe for aux (need >= 2 more)."
+    return
+  fi
+  echo "  Special layouts that fit (${label}; ${fit} eligible):"
+  while IFS= read -r layout; do
+    [[ -n "$layout" ]] || continue
+    nvme_n=$(special_layout_nvme_total "$layout") || continue
+    need=$((aux + nvme_n))
+    printf '    %-18s %2d NVMe special/spare  (need %2d unused NVMe total)  %s\n' \
+      "$layout" "$nvme_n" "$need" "$(special_layout_summary "$layout")"
+  done < <(assess_candidate_layouts "$fit")
+}
+
 assess_print_special_feasibility() {
-  local unused=$1 special_fit=$2 small_n=$3 large_n=$4 large_sz=$5
-  local need layout nvme_n
+  local unused=$1 special_fit_l2arc=$2 special_fit_nocache=$3 small_n=$4 large_n=$5 large_sz=$6
   echo "--- Special vdev feasibility (priority) ---"
   echo "  Losing an entire special vdev loses the pool — prefer mirrored special in production."
   echo "  Sizing: ~0.2–2% of data capacity for metadata; up to ~5% if using special_small_blocks."
@@ -2243,22 +2546,15 @@ assess_print_special_feasibility() {
   else
     echo "  SLOG + L2ARC: YES (4 smallest unused NVMe: 2 SLOG mirror + 2 L2ARC; CACHE=N keeps the 2 L2ARC NVMe free)"
   fi
-  if (( special_fit < 2 )); then
-    echo "  Special vdev: NO layout fits after reserving 4 NVMe for log+cache (need >= 2 more)."
-  else
-    echo "  Special layouts that fit (largest unused NVMe tier, after 4 for log+cache; ${special_fit} eligible):"
-    while IFS= read -r layout; do
-      [[ -n "$layout" ]] || continue
-      nvme_n=$(special_layout_nvme_total "$layout") || continue
-      need=$((4 + nvme_n))
-      printf '    %-18s %2d NVMe special/spare  (need %2d unused NVMe total)  %s\n' \
-        "$layout" "$nvme_n" "$need" "$(special_layout_summary "$layout")"
-    done < <(assess_candidate_layouts "$special_fit")
-  fi
+  assess_print_special_layout_list "largest unused NVMe tier, after 4 for log+cache" "$special_fit_l2arc" 4
+  assess_print_special_layout_list "CACHE=N, after 2 for SLOG only" "$special_fit_nocache" 2
   if (( small_n > 0 && small_n < 4 && large_n >= 10 )); then
     echo
     echo "  Hardware gap: ${small_n} small NVMe is not enough for dedicated SLOG/L2ARC."
-    echo "    Adding $((4 - small_n)) smaller NVMe would keep all ${large_n} large ($(human_bytes "$large_sz")) disks for special."
+    echo "    Adding $((4 - small_n)) smaller NVMe would keep all ${large_n} large ($(human_bytes "$large_sz")) disks for special even with L2ARC."
+    if (( special_fit_nocache >= large_n )); then
+      echo "    CACHE=N already keeps all ${large_n} large disks for special (SLOG uses the ${small_n} small)."
+    fi
   fi
   echo
 }
@@ -2286,7 +2582,7 @@ assess_print_create_option() {
   if [[ "$cache" == Y ]]; then
     extra="    Aux:      2× NVMe SLOG mirror + 2× NVMe L2ARC"
   else
-    extra="    Aux:      2× NVMe SLOG mirror, no L2ARC (CACHE=N — 2 small NVMe stay free)"
+    extra="    Aux:      2× NVMe SLOG mirror, no L2ARC (CACHE=N)"
   fi
   if [[ -n "$layout" ]]; then
     spec_u=$(assess_special_usable_bytes "$layout" "$nvme_sz")
@@ -2322,55 +2618,61 @@ assess_print_create_option() {
 }
 
 # raidz2/raidz3 recommended rows: default-count 2-way and 3-way special only (keeps the list readable).
+# CACHE=Y uses special_fit_l2arc (4 NVMe reserved); CACHE=N uses special_fit_nocache (SLOG only).
 assess_print_raidz_recommended() {
   local parity=$1 navail=$2 vendor=$3 disk_b=$4 nvme_sz=$5
-  local width ndisks hdd_spares spec layout def2 def3
-  local -a cand_layouts=()
+  local width ndisks hdd_spares spec layout
+  local d2y="" d3y="" d2n="" d3n=""
+  local fit_y=${special_fit_l2arc:-0} fit_n=${special_fit_nocache:-0}
   width=$(assess_pick_raidz_width "$navail" "$parity")
   ndisks=$((navail - navail % width))
   (( ndisks >= width && width >= parity + 4 )) || return 0
   hdd_spares=$((navail - ndisks))
   spec="raidz${parity}"
   ASSESS_TOPOLOGY="raidz${parity}"
-  mapfile -t cand_layouts < <(assess_candidate_layouts "$special_fit")
-  ((${#cand_layouts[@]} > 0)) && [[ -n "${cand_layouts[0]:-}" ]] || return 0
-  if (( SPECIAL_ENABLED )) && [[ -n "${SPECIAL_LAYOUT:-}" ]]; then
-    if (( $(special_layout_nvme_total "$SPECIAL_LAYOUT" 2>/dev/null || echo 999) <= special_fit )); then
-      [[ " ${cand_layouts[*]} " == *" ${SPECIAL_LAYOUT} "* ]] || cand_layouts+=("$SPECIAL_LAYOUT")
-    fi
+  if (( fit_y >= 2 )); then
+    { IFS= read -r d2y; IFS= read -r d3y; } < <(assess_default_mirror_layouts "$fit_y")
   fi
-  def2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
-  def3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
-  # Fewer than SPECIAL_NVME_COUNT eligible NVMe: recommend the largest layouts that do fit instead.
-  if [[ " ${cand_layouts[*]} " != *" ${def2} "* && " ${cand_layouts[*]} " != *" ${def3} "* ]]; then
-    def2=$(special_layout_from_count "$special_fit" 2 2>/dev/null || true)
-    def3=$(special_layout_from_count "$special_fit" 3 2>/dev/null || true)
+  if (( fit_n >= 2 )); then
+    { IFS= read -r d2n; IFS= read -r d3n; } < <(assess_default_mirror_layouts "$fit_n")
   fi
+  [[ -n "$d2y$d3y$d2n$d3n" ]] || return 0
   echo "--- raidz${parity} (${ndisks} data disks → $((ndisks / width)) × ${spec} of ${width}; leftover ${hdd_spares} spare) ---"
-  for layout in "${cand_layouts[@]}"; do
-    if [[ "$layout" == "$def2" ]]; then
-      assess_print_create_option \
-        "RECOMMENDED — raidz${parity} + special ${layout} ($(special_layout_nvme_total "$layout") NVMe, 2-way mirrors) + L2ARC" \
-        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
-      assess_print_create_option \
-        "RECOMMENDED — raidz${parity} + special ${layout} ($(special_layout_nvme_total "$layout") NVMe, 2-way mirrors), no L2ARC" \
-        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
-    elif [[ "$layout" == "$def3" ]]; then
-      assess_print_create_option \
-        "RECOMMENDED (extra redundancy) — raidz${parity} + special ${layout} ($(special_layout_nvme_total "$layout") NVMe, 3-way mirrors) + L2ARC" \
-        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
-      assess_print_create_option \
-        "RECOMMENDED (extra redundancy) — raidz${parity} + special ${layout} ($(special_layout_nvme_total "$layout") NVMe, 3-way mirrors), no L2ARC" \
-        "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
-    elif [[ -n "${SPECIAL_LAYOUT:-}" && "$layout" == "$SPECIAL_LAYOUT" ]]; then
+  if [[ -n "$d2y" ]]; then
+    assess_print_create_option \
+      "RECOMMENDED — raidz${parity} + special ${d2y} ($(special_layout_nvme_total "$d2y") NVMe, 2-way mirrors) + L2ARC" \
+      "$parity" "$width" "$ndisks" "$vendor" "$d2y" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
+  fi
+  if [[ -n "$d2n" ]]; then
+    assess_print_create_option \
+      "RECOMMENDED — raidz${parity} + special ${d2n} ($(special_layout_nvme_total "$d2n") NVMe, 2-way mirrors), no L2ARC" \
+      "$parity" "$width" "$ndisks" "$vendor" "$d2n" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
+  fi
+  if [[ -n "$d3y" ]]; then
+    assess_print_create_option \
+      "RECOMMENDED (extra redundancy) — raidz${parity} + special ${d3y} ($(special_layout_nvme_total "$d3y") NVMe, 3-way mirrors) + L2ARC" \
+      "$parity" "$width" "$ndisks" "$vendor" "$d3y" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
+  fi
+  if [[ -n "$d3n" ]]; then
+    assess_print_create_option \
+      "RECOMMENDED (extra redundancy) — raidz${parity} + special ${d3n} ($(special_layout_nvme_total "$d3n") NVMe, 3-way mirrors), no L2ARC" \
+      "$parity" "$width" "$ndisks" "$vendor" "$d3n" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
+  fi
+  if (( SPECIAL_ENABLED )) && [[ -n "${SPECIAL_LAYOUT:-}" ]]; then
+    layout=$SPECIAL_LAYOUT
+    if (( $(special_layout_nvme_total "$layout" 2>/dev/null || echo 999) <= fit_y )) && \
+       [[ "$layout" != "$d2y" && "$layout" != "$d3y" ]]; then
       assess_print_create_option \
         "REQUESTED — raidz${parity} + special ${layout} ($(special_layout_summary "$layout")) + L2ARC" \
         "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" Y
+    fi
+    if (( $(special_layout_nvme_total "$layout" 2>/dev/null || echo 999) <= fit_n )) && \
+       [[ "$layout" != "$d2n" && "$layout" != "$d3n" ]]; then
       assess_print_create_option \
         "REQUESTED — raidz${parity} + special ${layout}, no L2ARC" \
         "$parity" "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "$nvme_sz" "$hdd_spares" N
     fi
-  done
+  fi
 }
 
 assess_print_unused_hdd_maps() {
@@ -2525,6 +2827,8 @@ run_storage_assessment() {
     small_n=0
     large_n=0
     special_fit=0
+    special_fit_l2arc=0
+    special_fit_nocache=0
     alias_maps=0
     unused_hdd_n=0
     declare -A grp_count=() grp_unused=() grp_vendor=() grp_product=() grp_size=()
@@ -2643,6 +2947,7 @@ run_storage_assessment() {
     echo
 
     echo "--- NVMe inventory ---"
+    assess_print_numa_topology
     while IFS= read -r path; do
       [[ -z "$path" ]] && continue
       sz=$(blockdev --getsize64 "$path" 2>/dev/null || echo 0)
@@ -2663,7 +2968,7 @@ run_storage_assessment() {
       for row in "${nvme_rows[@]}"; do
         IFS='|' read -r sz path model status vpat <<<"$row"
         [[ "$status" == unused ]] || continue
-        printf '    %10s  %s  (%s)\n' "$(human_bytes "$sz")" "$path" "$model"
+        printf '    %10s  %s  (%s)  [%s]\n' "$(human_bytes "$sz")" "$path" "$model" "$(nvme_place_brief "$path")"
         printed_unused=1
       done
       (( printed_unused == 1 )) || echo "    (none)"
@@ -2672,7 +2977,7 @@ run_storage_assessment() {
       for row in "${nvme_rows[@]}"; do
         IFS='|' read -r sz path model status vpat <<<"$row"
         [[ "$status" == unused ]] && continue
-        printf '    %10s  %s  [%s]  (%s)\n' "$(human_bytes "$sz")" "$path" "$status" "$model"
+        printf '    %10s  %s  [%s]  (%s)  [%s]\n' "$(human_bytes "$sz")" "$path" "$status" "$model" "$(nvme_place_brief "$path")"
         printed_used=1
       done
       (( printed_used == 1 )) || echo "    (none)"
@@ -2686,22 +2991,15 @@ run_storage_assessment() {
       large_n=${nvme_sz_unused[$large_sz]:-0}
     fi
 
-    # After 4 smallest for log+cache, remaining largest-tier disks for special.
-    if (( unused_nvme_n >= 4 )); then
-      if (( large_sz != small_sz )); then
-        special_fit=$large_n
-        if (( small_n < 4 )); then
-          special_fit=$((unused_nvme_n - 4))
-        fi
-      else
-        special_fit=$((unused_nvme_n - 4))
-      fi
-    else
-      special_fit=0
-    fi
+    # L2ARC rows reserve 4 NVMe (SLOG+L2ARC). CACHE=N rows reserve 2 for SLOG only,
+    # so the 10 large NVMe can form mirror3x3+1spare when only 2 small disks exist.
+    special_fit_l2arc=$(assess_nvme_special_fit "$unused_nvme_n" "$small_n" "$large_n" "$large_sz" "$small_sz" 4)
+    special_fit_nocache=$(assess_nvme_special_fit "$unused_nvme_n" "$small_n" "$large_n" "$large_sz" "$small_sz" 2)
+    special_fit=$special_fit_l2arc
+    (( special_fit_nocache > special_fit )) && special_fit=$special_fit_nocache
 
     assess_print_jbod_and_test_plan "${#mpath_rows[@]}" "$unused_nvme_n" "$unused_hdd_n"
-    assess_print_special_feasibility "$unused_nvme_n" "$special_fit" "$small_n" "$large_n" "$large_sz"
+    assess_print_special_feasibility "$unused_nvme_n" "$special_fit_l2arc" "$special_fit_nocache" "$small_n" "$large_n" "$large_sz"
 
     echo "======== RECOMMENDED DEPLOYMENTS (special vdev first) ========"
     echo "Ranked: raidz3, raidz2, then dRAID. Commands are copy/paste; dry-run first, then drop DRY_RUN=1."
@@ -2738,17 +3036,17 @@ run_storage_assessment() {
         alt_ndisks=$((navail - navail % 26))
       fi
 
-      # Candidate special layouts that fit; the default-count layouts (2-way, then 3-way) are RECOMMENDED,
-      # each shown with L2ARC and without (CACHE=N). Larger/raidz layouts follow as alternatives.
-      mapfile -t cand_layouts < <(assess_candidate_layouts "$special_fit")
-      if (( SPECIAL_ENABLED )) && [[ -n "$SPECIAL_LAYOUT" ]]; then
-        if (( $(special_layout_nvme_total "$SPECIAL_LAYOUT" 2>/dev/null || echo 999) <= special_fit )); then
-          [[ " ${cand_layouts[*]} " == *" ${SPECIAL_LAYOUT} "* ]] || cand_layouts+=("$SPECIAL_LAYOUT")
-        fi
+      # Default 2-way / 3-way special: L2ARC rows use the smaller fit; CACHE=N can use more NVMe.
+      d2y=""; d3y=""; d2n=""; d3n=""
+      if (( special_fit_l2arc >= 2 )); then
+        { IFS= read -r d2y; IFS= read -r d3y; } < <(assess_default_mirror_layouts "$special_fit_l2arc")
       fi
-      best_layout="${cand_layouts[0]:-}"
-      def2=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 2 2>/dev/null || true)
-      def3=$(special_layout_from_count "$SPECIAL_NVME_COUNT" 3 2>/dev/null || true)
+      if (( special_fit_nocache >= 2 )); then
+        { IFS= read -r d2n; IFS= read -r d3n; } < <(assess_default_mirror_layouts "$special_fit_nocache")
+      fi
+      best_layout_l2arc=${d2y:-$d3y}
+      best_layout_nocache=${d2n:-$d3n}
+      best_layout=${best_layout_l2arc:-$best_layout_nocache}
 
       if [[ -n "$best_layout" ]]; then
         assess_print_raidz_recommended 3 "$navail" "$vendor" "$disk_b" "${large_sz:-0}"
@@ -2759,62 +3057,99 @@ run_storage_assessment() {
 
       spec=$(compute_best_draid_spec "$width" 3 balanced 2>/dev/null || true)
       if [[ -n "$spec" && -n "$best_layout" ]]; then
-        for layout in "${cand_layouts[@]}"; do
-          nvme_n=$(special_layout_nvme_total "$layout") || continue
-          if [[ "$layout" == "$def2" ]]; then
-            assess_print_create_option \
-              "ALTERNATIVE — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 2-way mirrors) + L2ARC" \
-              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
-            assess_print_create_option \
-              "ALTERNATIVE — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 2-way mirrors), no L2ARC" \
-              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
-          elif [[ "$layout" == "$def3" ]]; then
-            assess_print_create_option \
-              "ALTERNATIVE (extra redundancy) — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 3-way mirrors) + L2ARC" \
-              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
-            assess_print_create_option \
-              "ALTERNATIVE (extra redundancy) — dRAID3 + special ${layout} (${SPECIAL_NVME_COUNT} NVMe, 3-way mirrors), no L2ARC" \
-              3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
-          else
+        if [[ -n "$d2y" ]]; then
+          assess_print_create_option \
+            "ALTERNATIVE — dRAID3 + special ${d2y} ($(special_layout_nvme_total "$d2y") NVMe, 2-way mirrors) + L2ARC" \
+            3 "$width" "$ndisks" "$vendor" "$d2y" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+        fi
+        if [[ -n "$d2n" ]]; then
+          assess_print_create_option \
+            "ALTERNATIVE — dRAID3 + special ${d2n} ($(special_layout_nvme_total "$d2n") NVMe, 2-way mirrors), no L2ARC" \
+            3 "$width" "$ndisks" "$vendor" "$d2n" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+        fi
+        if [[ -n "$d3y" ]]; then
+          assess_print_create_option \
+            "ALTERNATIVE (extra redundancy) — dRAID3 + special ${d3y} ($(special_layout_nvme_total "$d3y") NVMe, 3-way mirrors) + L2ARC" \
+            3 "$width" "$ndisks" "$vendor" "$d3y" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+        fi
+        if [[ -n "$d3n" ]]; then
+          assess_print_create_option \
+            "ALTERNATIVE (extra redundancy) — dRAID3 + special ${d3n} ($(special_layout_nvme_total "$d3n") NVMe, 3-way mirrors), no L2ARC" \
+            3 "$width" "$ndisks" "$vendor" "$d3n" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+        fi
+        declare -A draid_extra_seen=()
+        for fit_extra in "$special_fit_l2arc" "$special_fit_nocache"; do
+          (( fit_extra >= 2 )) || continue
+          while IFS= read -r layout; do
+            [[ -n "$layout" ]] || continue
+            [[ "$layout" == "$d2y" || "$layout" == "$d3y" || "$layout" == "$d2n" || "$layout" == "$d3n" ]] && continue
+            [[ -n "${draid_extra_seen[$layout]:-}" ]] && continue
+            draid_extra_seen[$layout]=1
+            nvme_n=$(special_layout_nvme_total "$layout") || continue
             if [[ -n "${SPECIAL_LAYOUT:-}" && "$layout" == "$SPECIAL_LAYOUT" ]]; then
-              assess_print_create_option \
-                "REQUESTED — dRAID3 + special ${layout} ($(special_layout_summary "$layout")) + L2ARC" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
-              assess_print_create_option \
-                "REQUESTED — dRAID3 + special ${layout}, no L2ARC" \
-                3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
-            else
+              if (( nvme_n <= special_fit_l2arc )); then
+                assess_print_create_option \
+                  "REQUESTED — dRAID3 + special ${layout} ($(special_layout_summary "$layout")) + L2ARC" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+              fi
+              if (( nvme_n <= special_fit_nocache )); then
+                assess_print_create_option \
+                  "REQUESTED — dRAID3 + special ${layout}, no L2ARC" \
+                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+              fi
+              continue
+            fi
             case "$layout" in
               raidz*)
-                assess_print_create_option \
-                  "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
-                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                if (( nvme_n <= special_fit_l2arc )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                elif (( nvme_n <= special_fit_nocache )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (capacity special, not preferred) — dRAID3 + ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                fi
                 ;;
               mirror3x*)
-                assess_print_create_option \
-                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors) — dRAID3 + special ${layout}" \
-                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
-                assess_print_create_option \
-                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
-                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                if (( nvme_n <= special_fit_l2arc )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors) — dRAID3 + special ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                fi
+                if (( nvme_n <= special_fit_nocache )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (all ${nvme_n} eligible NVMe, 3-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                fi
                 ;;
               *)
-                assess_print_create_option \
-                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors) — dRAID3 + special ${layout}" \
-                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
-                assess_print_create_option \
-                  "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
-                  3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                if (( nvme_n <= special_fit_l2arc )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors) — dRAID3 + special ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+                fi
+                if (( nvme_n <= special_fit_nocache )); then
+                  assess_print_create_option \
+                    "ALTERNATIVE (all ${nvme_n} eligible NVMe, 2-way mirrors), no L2ARC — dRAID3 + special ${layout}" \
+                    3 "$width" "$ndisks" "$vendor" "$layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
+                fi
                 ;;
             esac
-            fi
-          fi
+          done < <(assess_candidate_layouts "$fit_extra")
         done
+        unset draid_extra_seen
         if (( alt_width > 0 )); then
           alt_spec=$(compute_best_draid_spec "$alt_width" 3 balanced 2>/dev/null || true)
-          [[ -n "$alt_spec" ]] && assess_print_create_option \
-            "ALTERNATIVE — dRAID3 + special ${best_layout}, proven 26-wide vdevs" \
-            3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))" Y
+          if [[ -n "$alt_spec" && -n "$best_layout_l2arc" ]]; then
+            assess_print_create_option \
+              "ALTERNATIVE — dRAID3 + special ${best_layout_l2arc}, proven 26-wide vdevs" \
+              3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout_l2arc" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))" Y
+          elif [[ -n "$alt_spec" && -n "$best_layout_nocache" ]]; then
+            assess_print_create_option \
+              "ALTERNATIVE — dRAID3 + special ${best_layout_nocache}, proven 26-wide vdevs" \
+              3 "$alt_width" "$alt_ndisks" "$vendor" "$best_layout_nocache" "$disk_b" "$alt_spec" "${large_sz:-0}" "$((navail - alt_ndisks))" N
+          fi
         fi
       elif [[ -n "$spec" ]]; then
         echo "No special vdev layout fits this host. raidz3/dRAID3 without special are listed last."
@@ -2822,10 +3157,14 @@ run_storage_assessment() {
       fi
 
       spec=$(compute_best_draid_spec "$width" 2 balanced 2>/dev/null || true)
-      if [[ -n "$spec" && -n "$best_layout" ]]; then
+      if [[ -n "$spec" && -n "$best_layout_l2arc" ]]; then
         assess_print_create_option \
-          "ALTERNATIVE — dRAID2 + special ${best_layout} (more capacity, less parity)" \
-          2 "$width" "$ndisks" "$vendor" "$best_layout" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares"
+          "ALTERNATIVE — dRAID2 + special ${best_layout_l2arc} (more capacity, less parity)" \
+          2 "$width" "$ndisks" "$vendor" "$best_layout_l2arc" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" Y
+      elif [[ -n "$spec" && -n "$best_layout_nocache" ]]; then
+        assess_print_create_option \
+          "ALTERNATIVE — dRAID2 + special ${best_layout_nocache} (more capacity, less parity)" \
+          2 "$width" "$ndisks" "$vendor" "$best_layout_nocache" "$disk_b" "$spec" "${large_sz:-0}" "$hdd_spares" N
       fi
     done
 
@@ -3023,16 +3362,35 @@ else
   fi
   unset _alias_n
 
-  mapfile -t _WWIDS < <(collect_multipath_wwids_all)
+  mapfile -t _ALL_WWIDS < <(collect_multipath_wwids_all)
+  _WWIDS=()
+  _skipped_inuse=0
+  local_wwid=
+  for local_wwid in "${_ALL_WWIDS[@]+"${_ALL_WWIDS[@]}"}"; do
+    [[ -n "$local_wwid" ]] || continue
+    if mpath_wwid_is_available "$local_wwid"; then
+      _WWIDS+=("$local_wwid")
+    else
+      _skipped_inuse=$((_skipped_inuse + 1))
+    fi
+  done
   _need_hdd=$((TOTAL_DISKS + HDD_SPARE_COUNT))
+  if (( _skipped_inuse > 0 )); then
+    echo "Note: skipped ${_skipped_inuse} matching map(s) already in a pool or otherwise in use (same unused rule as --analyze); ${#_WWIDS[@]} unused remain."
+  fi
   if (( ${#_WWIDS[@]} < _need_hdd )); then
-    echo "Error: multipath matched ${#_WWIDS[@]} disk(s) for pattern '${DISK_PATTERN}', need ${_need_hdd} (${TOTAL_DISKS} data + ${HDD_SPARE_COUNT} hot spare)." >&2
+    echo "Error: ${#_WWIDS[@]} unused disk(s) matching '${DISK_PATTERN}', need ${_need_hdd} (${TOTAL_DISKS} data + ${HDD_SPARE_COUNT} hot spare)." >&2
+    if (( _skipped_inuse > 0 )); then
+      echo "  ${_skipped_inuse} matching map(s) were skipped because they are in use (typically another imported pool)." >&2
+      echo "  Run --analyze to list unused maps. ZPOOL_FORCE=1 does not steal another pool's disks." >&2
+    fi
     exit 1
   fi
 
   if (( ${#_WWIDS[@]} > _need_hdd )); then
-    echo "Note: using first ${_need_hdd} of ${#_WWIDS[@]} matched disks (order: MPATH_SORT=${MPATH_SORT:-dm}); $(( ${#_WWIDS[@]} - _need_hdd )) left unused — consider HDD_SPARE_COUNT." >&2
+    echo "Note: using first ${_need_hdd} of ${#_WWIDS[@]} unused disks (order: MPATH_SORT=${MPATH_SORT:-dm}); $(( ${#_WWIDS[@]} - _need_hdd )) left unused — consider HDD_SPARE_COUNT." >&2
   fi
+  unset _ALL_WWIDS _skipped_inuse
 
   local_wwid=
   for local_wwid in "${_WWIDS[@]:0:TOTAL_DISKS}"; do
